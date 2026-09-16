@@ -1,8 +1,9 @@
 # Archivist Fox
 
 A Discord bot that watches messages for media links — either direct file
-links (`.jpg`, `.mp4`, etc.) or social platform posts (Twitter/X, TikTok,
-Instagram, Reddit, and more) — downloads the media, and replies to the
+links (`.jpg`, `.mp4`, `.mp3`, etc.), social platform posts (Twitter/X, TikTok,
+Instagram, Reddit, and more), or audio/music tracks (SoundCloud, Bandcamp,
+Mixcloud, Audiomack, YouTube Music) — downloads the media, and replies to the
 original poster with it as a file attachment.
 
 ## How it works
@@ -59,11 +60,18 @@ original poster with it as a file attachment.
 | `DISALLOWED_CHANNEL_IDS` | (none) | Comma-separated channel IDs to exclude — the bot runs everywhere else. Only applies when `ALLOWED_CHANNEL_IDS` is empty |
 | `MAX_FILE_SIZE_MB` | `10` | Max size the bot will upload. Match this to your server's boost level (10 / 50 / 100 MB) |
 | `ENABLE_COMPRESSION` | `true` | Re-encode oversized videos down with ffmpeg to fit the limit |
-| `HARD_CAP_MB` | `200` | Largest file the bot will ever download, even when trying to compress |
+| `HARD_CAP_MB` | `2000` | Largest file the bot will ever download, even when trying to compress |
 | `CLEANUP_TEMP_FILES` | `true` | Delete downloaded files after uploading (recommended) |
 | `YTDLP_PATH` / `GALLERYDL_PATH` / `FFMPEG_PATH` / `FFPROBE_PATH` | on PATH | Override if those binaries aren't on your system PATH |
 | `ERROR_MESSAGE_TTL_SECONDS` | `0` | Auto-delete error/status messages after this many seconds. `0` = never delete |
 | `RETRY_COMMAND` | `!repost` | Reply to a message with a link and send this to retry it (see below) |
+| `INCLUDE_TITLE_IN_MESSAGE` | `true` | Include the original media/post title in the bot's reply |
+| `EMBED_THUMBNAIL` | `true` | Embed thumbnail artwork into downloaded video files via ffmpeg |
+| `PREPEND_THUMBNAIL_PREVIEW` | `true` | Inject a 0.15s frozen thumbnail frame into videos to ensure instant Discord video player previews |
+| `ENABLE_AUDIO_EXTRACTION` | `true` | Extract and process audio tracks from SoundCloud, Bandcamp, YouTube Music, etc. |
+| `AUDIO_FORMAT` | `mp3` | Target audio format for downloaded songs/tracks |
+| `AUDIO_QUALITY` | `0` | VBR audio quality (`0` = highest quality / ~320kbps) |
+| `MAX_AUDIO_BITRATE_KBPS` | `320` | Max audio bitrate allowed before compressing oversized audio |
 | `ENABLE_LOCAL_ARCHIVE` | `true` | Permanently save full-quality uncompressed media to your local PC |
 | `ARCHIVE_DIRECTORY` | `./archives` | Folder path on your PC where original files are preserved |
 | `ARCHIVE_SAVE_METADATA` | `true` | Save a matching `.json` metadata file (URL, author, channel, date) alongside media |
@@ -87,6 +95,12 @@ original poster with it as a file attachment.
 | `AUTO_SCAN_HOURS` | `24` | How many hours back from bot startup to scan across all allowed channels |
 | `AUTO_SCAN_REPOST_MISSING` | `true` | Repost missing media attachments to Discord during the startup catch-up scan |
 | `AUTO_SCAN_CONCURRENCY` | `3` | Number of parallel download workers during the startup catch-up scan |
+| `COOKIES_FROM_BROWSER` | `firefox` | Directly read login cookies from your local browser (`firefox`, `chrome`, `edge`, `brave`) |
+| `PREFER_BROWSER_COOKIES` | `false` | Prioritize browser cookies over manual cookie files in `./cookies` |
+| `IMPERSONATE_BROWSER` | `auto` | Mimic real browser fingerprint (`auto`, `chrome`, `firefox`, `edge`, `safari`, `off`) to bypass anti-bot blocks |
+| `ENABLE_HUMAN_JITTER` | `true` | Add subtle randomized delays between download requests to prevent rate limits |
+| `HUMAN_JITTER_MIN_MS` | `1500` | Minimum delay in milliseconds for human jitter |
+| `HUMAN_JITTER_MAX_MS` | `3500` | Maximum delay in milliseconds for human jitter |
 
 ## Slash Commands & Context Menu Apps
 
@@ -103,6 +117,8 @@ Archivist Fox includes modern Discord Application Commands:
 - **`/rescan [channel] [limit] [missing_only] [force] [concurrency]`**:
   - Interactive slash command to scan channel message history and bulk-archive media directly from Discord.
   - Prefix command equivalent: `!rescan 500 --repost-missing -c 4` (use `-c` or `--concurrency` to control parallel download speed).
+- **`/stop`**:
+  - Immediately aborts and halts any running `/rescan` channel crawl, bulk archiving session, or queued background tasks.
 - **Duplicate Notice "Dismiss" Button**:
   - When the bot sends an alert that a link has already been posted, a `🗑️ Dismiss` button is attached. The original poster or server moderators can click it to immediately clear the alert and keep chat clean.
 
@@ -166,4 +182,4 @@ This only covers public content — no login or refresh token needed. If you sti
 - Some sites (notably Reddit) serve video and audio as separate streams. yt-dlp normally merges these via ffmpeg, but if ffmpeg isn't properly detected, it silently falls back to leaving them as two separate files. The bot double-checks for this after every platform download and merges any leftover video-only + audio-only pair itself — but this still requires a working ffmpeg install. **On Windows especially**, `pip install`-ing yt-dlp/gallery-dl does *not* install ffmpeg — you need to download it separately (e.g. from https://www.gyan.dev/ffmpeg/builds/) and add its `bin` folder to your PATH, then confirm with `ffmpeg -version` in a fresh terminal.
 - X (Twitter) has increasingly restricted unauthenticated scraping. If gallery-dl starts failing on X links specifically, you may need to supply login cookies — see [gallery-dl's Twitter docs](https://github.com/mikf/gallery-dl/blob/master/docs/configuration.rst) for how to configure `cookies`.
 - The bot currently recognizes a fixed list of platform domains (see `PLATFORM_DOMAINS` in `src/urlExtractor.js`) so it doesn't spawn yt-dlp for every random link posted in chat. Add more domains there if you want to support additional sites — yt-dlp itself supports a very long list (see their [supported sites](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)).
-- This only reacts to new messages; it won't retroactively scan message history.
+- The bot monitors incoming chat messages in real time. Historical channel messages can be crawled and archived anytime using `/rescan` (or `!rescan`), and recently missed messages during host downtime are automatically caught up on startup (`AUTO_SCAN_ON_STARTUP=true`).
