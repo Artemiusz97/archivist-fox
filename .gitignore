@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+
+# Environment Variables & Private Secrets
+.env
+
+# SQLite Database & Storage
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Local Archive Media & Scraper Downloads
+archives/
+gallery-dl/
+
+# Cookie Vault (Personal Login Credentials)
+cookies/*
+!cookies/README.md
+
+# Scraper Executable Binaries (Auto-downloaded by ensureBinaries.js)
+yt-dlp.exe
+gallery-dl.exe
+yt-dlp
+gallery-dl
+gallery-dl.bin
+
+# Temporary & Test Media Files
+*.mp4
+*.mkv
+*.webm
+*.avi
+*.mov
+*.jpg
+*.jpeg
+*.png
+*.gif
+temp/
+tempmediaStorage/
+
+# Operating System & Editor Files
+.DS_Store
+Thumbs.db
+*.log
+
+# Distribution & Release Archives
+releases/
+dist/
