@@ -1,5 +1,7 @@
 # Archivist Fox
 
+[![Support on Ko-fi](https://img.shields.io/badge/Support_on_Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/artemszafik)
+
 A Discord bot that watches messages for media links — either direct file
 links (`.jpg`, `.mp4`, `.mp3`, etc.), social platform posts (Twitter/X, TikTok,
 Instagram, Reddit, and more), or audio/music tracks (SoundCloud, Bandcamp,
