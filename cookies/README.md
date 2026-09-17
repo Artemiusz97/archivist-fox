@@ -8,5 +8,6 @@ Drop platform-specific Netscape-format cookie files here to download age-restric
 - `reddit.txt` - Reddit cookies
 - `pixiv.txt` - Pixiv login cookies
 - `tiktok.txt` - TikTok cookies
+- `deviantart.txt` - DeviantArt cookies (for mature/age-gated deviations and high-res downloads)
 
 If a platform-specific cookie is not found, Archivist Fox automatically falls back to `cookies.txt` in the root folder.

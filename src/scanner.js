@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { ChannelType, PermissionFlagsBits, AttachmentBuilder } from 'discord.js';
 import { config, isChannelAllowed } from './config.js';
-import { extractMediaLinksAsync, extractAllUrlsAsync, normalizeUrl, extractPlatformMediaId } from './urlExtractor.js';
+import { extractMediaLinksAsync, extractAllUrlsAsync, normalizeUrl, extractPlatformMediaId, isDeviantArtUrl } from './urlExtractor.js';
 import { downloadDirect } from './directDownloader.js';
 import { downloadWithYtDlp } from './ytdlpDownloader.js';
 import { downloadWithGalleryDl } from './galleryDlDownloader.js';
@@ -116,6 +116,7 @@ export function parseRescanArgs(content, currentChannel) {
 
 /**
  * Downloads a platform or direct media link with automatic retries for transient errors.
+ * DeviantArt has no yt-dlp extractor and is routed directly to gallery-dl.
  */
 async function downloadMedia(link, destDir, maxRetries = 2) {
   let lastErr = null;
@@ -125,6 +126,30 @@ async function downloadMedia(link, destDir, maxRetries = 2) {
       if (link.type === 'direct') {
         const filePath = await downloadDirect(link.url, destDir, config.hardCapBytes);
         return [filePath];
+      }
+
+      // DeviantArt fast-path: yt-dlp has no DeviantArt extractor, go straight to gallery-dl.
+      if (isDeviantArtUrl(link.url)) {
+        try {
+          return await downloadWithGalleryDl(link.url, destDir);
+        } catch (err) {
+          lastErr = err;
+          const isTransient =
+            err?.message?.includes('TIMEOUT') ||
+            err?.message?.includes('429') ||
+            err?.message?.includes('rate limit') ||
+            err?.message?.includes('ECONNRESET') ||
+            err?.message?.includes('ETIMEDOUT');
+
+          if (isTransient && attempt <= maxRetries) {
+            console.warn(
+              `[Scanner] DeviantArt download of <${link.url}> hit transient error (${err.message}), retrying attempt ${attempt + 1}/${maxRetries + 1}...`
+            );
+            await new Promise((r) => setTimeout(r, attempt * 3000));
+            continue;
+          }
+          throw err;
+        }
       }
 
       try {

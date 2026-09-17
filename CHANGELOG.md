@@ -23,6 +23,7 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 
 | Version | Release Date | Type | Primary Milestone / Theme |
 | :--- | :--- | :--- | :--- |
+| **[v3.8.0](#v380---2026-09-17)** | 2026-09-17 | Minor | DeviantArt Platform Expansion: Native DeviantArt & Sta.sh scraping, fav.me base-36 canonical unshortening, gallery-dl fast-path routing, DeviantArt cookie vault. |
 | **[v3.7.0](#v370---2026-09-16)** | 2026-09-16 | Minor | Message Deletion Fallback, Context Menu Channel-Gating, Faststart Streaming & Live Telemetry. |
 | **[v3.6.1](#v361---2026-09-16)** | 2026-09-16 | Patch | Production Hardening Suite: Gateway exponential backoff, Anti-bot browser impersonation & human jitter, SQLite prepared statement cache & WAL tuning, Queue flood protection, Windows NTFS reserved name defense. |
 | **[v3.6.0](#v360---2026-09-15)** | 2026-09-15 | Minor | Startup Catch-Up Scanner & Browser Cookies: Automatic offline downtime catch-up scan, Direct browser cookie extraction (Firefox/Chrome/Edge/Brave). |
@@ -47,6 +48,20 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 ---
 
 ## Release Details
+
+### [v3.8.0] - 2026-09-17
+
+#### Added & Improved
+- **Dedicated DeviantArt Platform Support (`deviantart.com`, `fav.me`, `sta.sh`) (`src/urlExtractor.js`, `src/mediaHandler.js`, `src/scanner.js`)**:
+  - Full scraping support for DeviantArt artwork posts, galleries, Sta.sh uploads, and shortlinks.
+  - DeviantArt fast-path routes requests directly to `gallery-dl`, bypassing `yt-dlp` and reducing extraction latency.
+  - Maps artwork paths, Sta.sh, and `fav.me` shortlinks to canonical IDs (`deviantart:12345678`) using base-36 decoding.
+- **Port 80 `fav.me` Unshortening (`src/urlExtractor.js`)**:
+  - Unshortens `fav.me` shortlinks over HTTP port 80 in ~150ms, overcoming HTTPS port 443 absence and automated HEAD request blocks.
+- **DeviantArt Cookie Vault Integration (`src/cookieVault.js`, `cookies/README.md`)**:
+  - Automatically loads `cookies/deviantart.txt` or `cookies/da.txt` to archive age-gated and high-resolution deviations.
+- **Interactive Guide Updates (`src/commands.js`)**:
+  - Highlights DeviantArt in `/help` and feature summaries.
 
 ### [v3.7.0] - 2026-09-16
 

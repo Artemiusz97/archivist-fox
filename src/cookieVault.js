@@ -54,6 +54,8 @@ export function getCookieForUrl(url) {
         targetSite = 'twitch';
       } else if (hostname.includes('bilibili.com')) {
         targetSite = 'bilibili';
+      } else if (hostname.includes('deviantart.com') || hostname === 'fav.me' || hostname === 'sta.sh') {
+        targetSite = 'deviantart';
       }
 
       if (targetSite) {
@@ -64,6 +66,7 @@ export function getCookieForUrl(url) {
         else if (targetSite === 'youtube') candidateNames = ['youtube.txt', 'yt.txt'];
         else if (targetSite === 'instagram') candidateNames = ['instagram.txt', 'ig.txt'];
         else if (targetSite === 'bluesky') candidateNames = ['bluesky.txt', 'bsky.txt'];
+        else if (targetSite === 'deviantart') candidateNames = ['deviantart.txt', 'da.txt'];
 
         for (const filename of candidateNames) {
           const platformCookie = path.join(cookiesDir, filename);

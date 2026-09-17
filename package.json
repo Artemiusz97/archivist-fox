@@ -1,6 +1,6 @@
 {
   "name": "archivist-fox",
-  "version": "3.7.0",
+  "version": "3.8.0",
   "description": "Archivist Fox - Discord bot that detects media links (direct files and social platforms), downloads the media, and replies with it as a file attachment.",
   "type": "module",
   "main": "src/index.js",

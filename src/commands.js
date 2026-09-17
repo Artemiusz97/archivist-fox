@@ -216,8 +216,8 @@ export function getHelpEmbed() {
           '• **Fast Video Streaming:** Uses `+faststart` so videos play immediately while buffering.',
           '• **Duplicate Protection:** Prevents duplicate visual media and duplicate link spam.',
           '• **Interactive Dismiss:** Duplicate alerts include a `🗑️ Dismiss` button for instant cleanup.',
-          '• **Shortlink Resolution:** Automatically resolves `t.co`, `bit.ly`, `pin.it`, and TikTok shortlinks.',
-          '• **Supported Video/Image:** YouTube, Twitter/X, TikTok, Instagram, Reddit, Threads, Facebook, Bilibili, Bluesky, Streamable, RedGifs, Pixiv, Pinterest, Imgur.',
+          '• **Shortlink Resolution:** Automatically resolves `t.co`, `bit.ly`, `pin.it`, `fav.me`, and TikTok shortlinks.',
+          '• **Supported Video/Image:** YouTube, Twitter/X, TikTok, Instagram, Reddit, Threads, Facebook, Bilibili, Bluesky, Streamable, RedGifs, Pixiv, Pinterest, Imgur, **DeviantArt**.',
           '• **Supported Audio/Music:** SoundCloud, Bandcamp, Mixcloud, Audiomack, YouTube Music, Podcasts, and direct MP3/audio URLs.',
 
         ].join('\n'),
