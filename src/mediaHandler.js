@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { AttachmentBuilder } from 'discord.js';
 import { config } from './config.js';
-import { extractMediaLinksAsync, extractPlatformMediaId, normalizeUrl } from './urlExtractor.js';
+import { extractMediaLinksAsync, extractPlatformMediaId, normalizeUrl, isAudioUrl, isDeviantArtUrl } from './urlExtractor.js';
 import { downloadDirect } from './directDownloader.js';
 import { downloadWithYtDlp } from './ytdlpDownloader.js';
 import { downloadWithGalleryDl } from './galleryDlDownloader.js';
@@ -14,7 +14,6 @@ import { computeMediaFingerprint } from './phasher.js';
 import { findDuplicate, findDuplicateByUrl, saveRecord } from './db.js';
 import { downloadQueue } from './queue.js';
 import { applyThumbnailPreview, findThumbnailFile } from './thumbnailPreview.js';
-import { isAudioUrl } from './urlExtractor.js';
 
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'webm', 'mkv', 'avi', 'm4v']);
 const AUDIO_EXTENSIONS = new Set(['mp3', 'ogg', 'wav', 'flac', 'm4a', 'opus', 'aac', 'alac', 'aiff']);
@@ -403,7 +402,10 @@ function describeError(err) {
   if (msg.includes('Unavailable')) {
     return 'post is unavailable (deleted, private, or age-restricted)';
   }
-  if (msg.includes('HTTP redirect to login page') || msg.includes('login page')) {
+  if (msg.includes('NotFoundError') || msg.includes('could not be found')) {
+    return 'post was not found or deleted';
+  }
+  if (msg.includes('HTTP redirect to login page') || msg.includes('login page') || msg.includes('login required') || msg.includes('AuthenticationError')) {
     return 'post requires login credentials/cookies to download';
   }
   if (msg.includes('GLIBC') || msg.includes('PyInstaller')) {
@@ -419,6 +421,9 @@ function describeError(err) {
  * galleries and handles static-image posts (e.g. a plain photo tweet) that
  * yt-dlp explicitly refuses ("No video could be found in this tweet").
  * Includes automatic retry with exponential backoff for transient timeouts and rate limits.
+ *
+ * DeviantArt has no yt-dlp extractor, so it is routed directly to gallery-dl
+ * to avoid wasting a round-trip on a guaranteed failure.
  */
 async function downloadPlatformLink(url, destDir, maxRetries = 2, dlOptions = {}) {
   let lastErr = null;
@@ -429,6 +434,33 @@ async function downloadPlatformLink(url, destDir, maxRetries = 2, dlOptions = {}
     const jitterMs = getHumanJitterMs(config.humanJitterMinMs, config.humanJitterMaxMs);
     console.log(`[Anti-Bot] ⏳ Applied human jitter delay (${(jitterMs / 1000).toFixed(1)}s) before requesting <${url}>`);
     await new Promise((r) => setTimeout(r, jitterMs));
+  }
+
+  // DeviantArt fast-path: yt-dlp has no DeviantArt extractor, so skip directly to gallery-dl.
+  if (isDeviantArtUrl(url)) {
+    for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+      try {
+        return await downloadWithGalleryDl(url, destDir);
+      } catch (err) {
+        lastErr = err;
+        const isTransient =
+          err?.message?.includes('TIMEOUT') ||
+          err?.message?.includes('429') ||
+          err?.message?.includes('rate limit') ||
+          err?.message?.includes('ECONNRESET') ||
+          err?.message?.includes('ETIMEDOUT');
+
+        if (isTransient && attempt <= maxRetries) {
+          console.warn(
+            `[Downloader] DeviantArt download of <${url}> hit transient error (${err.message}), retrying attempt ${attempt + 1}/${maxRetries + 1}...`
+          );
+          await new Promise((r) => setTimeout(r, attempt * 3000));
+          continue;
+        }
+        break;
+      }
+    }
+    throw lastErr || new Error('Download failed');
   }
 
   for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {

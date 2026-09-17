@@ -13,6 +13,7 @@ const SHORTENER_HOSTS = new Set([
   'buff.ly',
   'ow.ly',
   'on.soundcloud.com',
+  'fav.me',  // DeviantArt shortlink (resolves to deviantart.com/USER/art/SLUG-ID)
 ]);
 
 const DIRECT_MEDIA_EXTENSIONS = new Set([
@@ -53,6 +54,9 @@ const PLATFORM_DOMAINS = [
   'bandcamp.com',
   'mixcloud.com',
   'audiomack.com',
+  'deviantart.com',  // DeviantArt image/artwork gallery
+  'fav.me',          // DeviantArt shortlink (resolved first via SHORTENER_HOSTS)
+  'sta.sh',          // DeviantArt Sta.sh upload links
 ];
 
 const TRACKING_PARAMS = new Set([
@@ -362,6 +366,37 @@ export function extractPlatformMediaId(rawUrl) {
         return `audiomack:${parts[0]}/${parts[2]}`;
       }
     }
+
+    // DeviantArt: /USER/art/SLUG-DEVIATIONID or /view/DEVIATIONID
+    if (host.includes('deviantart.com')) {
+      // Standard artwork URL: /USER/art/title-12345678, /art/title-12345678, /view/12345678
+      const artMatch = pathname.match(/\/(?:art|view)\/(?:.*-)?(\d+)\/?$/i);
+      if (artMatch) return `deviantart:${artMatch[1]}`;
+      // Stash URL: /stash/ALPHANUMID
+      const stashMatch = pathname.match(/\/stash\/([a-zA-Z0-9]+)\/?$/i);
+      if (stashMatch) return `deviantart:stash:${stashMatch[1]}`;
+    }
+
+    // DeviantArt shortlink via fav.me: https://fav.me/d<base36_id>
+    // fav.me links use base-36 deviation IDs prefixed by 'd' (e.g. dfpp9ce -> 950161550).
+    // Decoding this yields the identical canonical ID as the full deviantart.com URL.
+    if (host === 'fav.me') {
+      const rawId = pathname.slice(1).split('/')[0];
+      if (rawId) {
+        const stripped = rawId.replace(/^d/i, '');
+        const numericId = parseInt(stripped, 36);
+        if (!isNaN(numericId) && numericId > 0) {
+          return `deviantart:${numericId}`;
+        }
+        return `deviantart:favme:${rawId}`;
+      }
+    }
+
+    // DeviantArt Sta.sh: https://sta.sh/ALPHANUMID
+    if (host === 'sta.sh') {
+      const id = pathname.slice(1).split('/')[0];
+      if (id) return `deviantart:stash:${id}`;
+    }
   } catch {}
 
   return null;
@@ -402,6 +437,22 @@ export function isAudioUrl(rawUrl) {
 }
 
 /**
+ * Helper to determine if a URL is a DeviantArt link.
+ * DeviantArt has no yt-dlp extractor, so gallery-dl should be tried directly
+ * (skipping the yt-dlp attempt that would always fail and waste time).
+ */
+export function isDeviantArtUrl(rawUrl) {
+  if (!rawUrl) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase().replace(/^(www\.|m\.)/, '');
+    return host === 'deviantart.com' || host === 'fav.me' || host === 'sta.sh';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Fast resolution of known URL shorteners (e.g. t.co, bit.ly, pin.it, vt.tiktok.com)
  * Uses HEAD request with timeout, falling back to streamed GET if HEAD is rejected (405/403).
  */
@@ -418,6 +469,26 @@ export async function resolveShortUrl(rawUrl) {
       'User-Agent':
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     };
+
+    // fav.me does not listen on HTTPS port 443 and DeviantArt destination blocks automated HEAD requests.
+    // Reading the Location header via HTTP with maxRedirects: 0 unshortens in ~150ms cleanly.
+    if (host === 'fav.me') {
+      try {
+        const httpUrl = rawUrl.replace(/^https:\/\//i, 'http://');
+        const res = await axios.get(httpUrl, {
+          maxRedirects: 0,
+          timeout: 3000,
+          headers,
+          validateStatus: (s) => (s >= 300 && s < 400) || (s >= 200 && s < 300),
+        });
+        const loc = res.headers?.location;
+        if (loc) return loc;
+      } catch (favErr) {
+        const loc = favErr.response?.headers?.location;
+        if (loc) return loc;
+      }
+      return rawUrl;
+    }
 
     try {
       const res = await axios.head(rawUrl, {

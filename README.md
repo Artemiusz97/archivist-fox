@@ -3,16 +3,16 @@
 [![Support on Ko-fi](https://img.shields.io/badge/Support_on_Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/artemszafik)
 
 A Discord bot that watches messages for media links — either direct file
-links (`.jpg`, `.mp4`, `.mp3`, etc.), social platform posts (Twitter/X, TikTok,
-Instagram, Reddit, and more), or audio/music tracks (SoundCloud, Bandcamp,
-Mixcloud, Audiomack, YouTube Music) — downloads the media, and replies to the
-original poster with it as a file attachment.
+links (`.jpg`, `.mp4`, `.mp3`, etc.), social platform posts & art galleries
+(Twitter/X, TikTok, Instagram, Reddit, DeviantArt, and more), or audio/music
+tracks (SoundCloud, Bandcamp, Mixcloud, Audiomack, YouTube Music) — downloads
+the media, and replies to the original poster with it as a file attachment.
 
 ## How it works
 
 1. On every message, the bot scans for URLs.
 2. Direct media URLs (ending in a known image/video extension) are downloaded directly.
-3. Social platform links are handed to [yt-dlp](https://github.com/yt-dlp/yt-dlp) first (best for video/GIF posts). If yt-dlp reports no video was found — e.g. a plain photo post — the bot falls back to [gallery-dl](https://github.com/mikf/gallery-dl), which is built specifically for image galleries across Twitter/X, Instagram, Reddit, Tumblr, Pixiv, and more.
+3. Social platform links are handed to [yt-dlp](https://github.com/yt-dlp/yt-dlp) first (best for video/GIF posts). If yt-dlp reports no video was found — e.g. a plain photo post — the bot falls back to [gallery-dl](https://github.com/mikf/gallery-dl), which is built specifically for image galleries across Twitter/X, Instagram, Reddit, Tumblr, Pixiv, DeviantArt, and more.
 4. The bot replies to the original message with the downloaded file(s) attached.
 5. If a video is too big for Discord's upload limit, the bot tries to re-encode it down with ffmpeg (optional, and can be turned off).
 
