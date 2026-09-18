@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { AttachmentBuilder } from 'discord.js';
 import { config } from './config.js';
-import { extractMediaLinksAsync, extractPlatformMediaId, normalizeUrl, isAudioUrl, isDeviantArtUrl } from './urlExtractor.js';
+import { extractMediaLinksAsync, extractPlatformMediaId, normalizeUrl, isAudioUrl, isDeviantArtUrl, extractYouTubePlaylistDetails } from './urlExtractor.js';
 import { downloadDirect } from './directDownloader.js';
 import { downloadWithYtDlp } from './ytdlpDownloader.js';
 import { downloadWithGalleryDl } from './galleryDlDownloader.js';
@@ -62,14 +62,18 @@ async function cleanup(dir) {
  * @param {import('discord.js').MessageCreateOptions} options
  * @returns {Promise<import('discord.js').Message|null>}
  */
-async function safeReply(message, options) {
+async function safeReply(message, options, overrideChannel = null) {
+  const targetChannel = overrideChannel || message.channel;
   try {
+    if (overrideChannel) {
+      return await overrideChannel.send(options);
+    }
     return await message.reply(options);
   } catch (err) {
     // 10008 = Unknown Message: the trigger was deleted while we were downloading.
     // Fall back to channel.send() so the upload still reaches the channel.
     if (err?.code === 10008 || err?.message?.includes('Unknown Message')) {
-      return message.channel?.send(options).catch(() => null);
+      return targetChannel?.send(options).catch(() => null);
     }
     throw err;
   }
@@ -159,7 +163,7 @@ async function processMessage(message, links, options = {}, onStatus) {
                 const dupNotice = await safeReply(message, {
                   content: `ℹ️ This media was already posted by **@${urlMatch.postedBy}** in **#${urlMatch.channel}**!`,
                   allowedMentions: { repliedUser: false },
-                });
+                }, options.overrideChannel);
                 scheduleAutoDelete(dupNotice);
               }
               return; // Skip downloading and processing this already-archived post entirely
@@ -170,10 +174,12 @@ async function processMessage(message, links, options = {}, onStatus) {
             await onStatus('downloading');
           }
 
-          const filePaths =
-            link.type === 'direct'
-              ? [await downloadDirect(link.url, tempDir, config.hardCapBytes)]
-              : await downloadPlatformLink(link.url, tempDir, 2, options);
+          const dlResult = link.type === 'direct'
+            ? [await downloadDirect(link.url, tempDir, config.hardCapBytes)]
+            : await downloadPlatformLink(link.url, tempDir, 2, options);
+
+          const filePaths = Array.isArray(dlResult) ? dlResult : (dlResult.mediaFiles || []);
+          const subtitleFiles = Array.isArray(dlResult) ? [] : (dlResult.subtitleFiles || []);
 
           const currentMediaId = extractPlatformMediaId(link.url);
           const postRecordsToSave = [];
@@ -203,7 +209,7 @@ async function processMessage(message, links, options = {}, onStatus) {
                   const dupNotice = await safeReply(message, {
                     content: `ℹ️ This media was already posted by **@${match.postedBy}** in **#${match.channel}**!`,
                     allowedMentions: { repliedUser: false },
-                  });
+                  }, options.overrideChannel);
                   scheduleAutoDelete(dupNotice);
                 }
                 continue; // Skip saving duplicate file and skip uploading attachment
@@ -218,6 +224,7 @@ async function processMessage(message, links, options = {}, onStatus) {
               title: cleanTitle,
               mediaId: fingerprint.mediaId,
               sha256: fingerprint.sha256,
+              subtitleFiles: subtitleFiles,
             });
 
             // Queue entry into media index database
@@ -267,6 +274,74 @@ async function processMessage(message, links, options = {}, onStatus) {
                   isVideo: isVideo(finalPath),
                   isAudio: isAudio(finalPath),
                 });
+
+                // Attach Subtitles (if uploading to Discord is enabled)
+                if (config.uploadSubtitlesToDiscord && subtitleFiles && subtitleFiles.length > 0) {
+                  // Find English subs (handles .en.srt, .en-US.srt, and YouTube track IDs like .en-eEY6OEpapPo.srt)
+                  const enRegex = /(?:^|[._-])en(?:[-_][a-zA-Z0-9]+)?\.(?:srt|vtt)$/i;
+                  const englishSubs = subtitleFiles.filter((s) => enRegex.test(path.basename(s)));
+                  const nonEnglishSubs = subtitleFiles.filter((s) => !englishSubs.includes(s));
+
+                  // 1. Always prioritize and attach English subtitles individually
+                  for (const enSub of englishSubs) {
+                    const cleanName = getCleanSubtitleFilename(enSub, cleanTitle);
+                    attachments.push({
+                      attachment: new AttachmentBuilder(enSub, { name: cleanName }),
+                      title: `${cleanTitle} (English CC)`,
+                      isVideo: false,
+                      isAudio: false,
+                    });
+                  }
+
+                  // 2. Handle remaining subtitles (Zip if too many)
+                  if (nonEnglishSubs.length > 0) {
+                    if (config.zipMultiSubtitles && subtitleFiles.length > config.maxIndividualSubtitles) {
+                      try {
+                        const zipPath = path.join(tempDir, `${cleanTitle}_subtitles.zip`);
+                        const { spawnSync } = await import('node:child_process');
+                        
+                        const zipArgs = ['-a', '-c', '-f', path.basename(zipPath)];
+                        // Add ALL subtitle files into the zip for completeness
+                        for (const sub of subtitleFiles) {
+                          zipArgs.push(path.basename(sub));
+                        }
+                        
+                        const zipRes = spawnSync('tar', zipArgs, { cwd: tempDir, windowsHide: true });
+                        if (zipRes.status === 0 && fs.existsSync(zipPath)) {
+                          attachments.push({
+                            attachment: new AttachmentBuilder(zipPath, { name: path.basename(zipPath) }),
+                            title: `${cleanTitle} (All Subtitles)`,
+                            isVideo: false,
+                            isAudio: false,
+                          });
+                        } else {
+                          console.error('[Subtitles] Failed to zip subtitles:', zipRes.stderr?.toString());
+                          // Fallback to individual
+                          for (const sub of nonEnglishSubs) {
+                            attachments.push({
+                              attachment: new AttachmentBuilder(sub, { name: getCleanSubtitleFilename(sub, cleanTitle) }),
+                              title: `${cleanTitle} (CC)`,
+                              isVideo: false,
+                              isAudio: false,
+                            });
+                          }
+                        }
+                      } catch (err) {
+                        console.error('[Subtitles] Error creating zip:', err);
+                      }
+                    } else {
+                      // Attach remaining non-English subtitles individually
+                      for (const sub of nonEnglishSubs) {
+                        attachments.push({
+                          attachment: new AttachmentBuilder(sub, { name: getCleanSubtitleFilename(sub, cleanTitle) }),
+                          title: `${cleanTitle} (CC)`,
+                          isVideo: false,
+                          isAudio: false,
+                        });
+                      }
+                    }
+                  }
+                }
               } else {
                 failures.push({ url: link.url, reason: 'too large to upload even after compression' });
               }
@@ -327,7 +402,7 @@ async function processMessage(message, links, options = {}, onStatus) {
           replyOptions.content = `🖼️ Album Part ${batchNum}/${totalBatches} (${chunk.length} items):`;
         }
 
-        await safeReply(message, replyOptions);
+        await safeReply(message, replyOptions, options.overrideChannel);
       }
 
       // Automatically suppress the original link's preview embed to keep chat clean
@@ -349,7 +424,7 @@ async function processMessage(message, links, options = {}, onStatus) {
       const notice = await safeReply(message, {
         content: `Couldn't fetch some media:\n${lines.join('\n')}`,
         allowedMentions: { repliedUser: false },
-      });
+      }, options.overrideChannel);
       scheduleAutoDelete(notice);
     }
 
@@ -368,6 +443,20 @@ async function processMessage(message, links, options = {}, onStatus) {
  * @returns {Promise<{ found: number, uploaded: number, failed: number }>}
  */
 export async function handleMessage(message, options = {}) {
+  // 1. YouTube Playlist Detection
+  if (config.enablePlaylistDownload && !options.isRescan && !options.ignorePlaylists) {
+    const urls = message.content.match(/https?:\/\/[^\s<>()\[\]"]+/gi) || [];
+    for (const rawUrl of urls) {
+      const details = extractYouTubePlaylistDetails(rawUrl);
+      if (details.isPlaylist) {
+        // We defer to playlistHandler for prompt & download
+        // We import it dynamically to avoid circular dependencies
+        const { handlePlaylistPromptAndDownload } = await import('./playlistHandler.js');
+        return await handlePlaylistPromptAndDownload(message, rawUrl, details, options);
+      }
+    }
+  }
+
   const links = await extractMediaLinksAsync(message.content);
   if (links.length === 0) {
     if (options.notifyIfEmpty) {
@@ -499,4 +588,15 @@ async function downloadPlatformLink(url, destDir, maxRetries = 2, dlOptions = {}
   }
 
   throw lastErr || new Error('Download failed');
+}
+
+/**
+ * Normalizes subtitle filenames to standard '<Title>.<lang>.<ext>' by stripping
+ * custom internal YouTube track IDs (e.g. 'Song.ja-eEY6OEpapPo.srt' -> 'Song.ja.srt').
+ */
+function getCleanSubtitleFilename(subPath, cleanTitle) {
+  const ext = path.extname(subPath) || '.srt';
+  const base = path.basename(subPath, ext);
+  const match = base.match(/(?:^|[._-])([a-zA-Z]{2,3}(?:-[A-Za-z]{2,4})?)(?:-[a-zA-Z0-9_-]+)?$/i);
+  return match ? `${cleanTitle}.${match[1]}${ext}` : path.basename(subPath);
 }

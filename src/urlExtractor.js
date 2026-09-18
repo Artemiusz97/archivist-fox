@@ -238,10 +238,15 @@ export function extractPlatformMediaId(rawUrl) {
     const host = parsed.hostname.toLowerCase();
     const pathname = parsed.pathname;
 
-    // YouTube: watch?v=ID, /shorts/ID, /embed/ID, /v/ID, /live/ID
+    // YouTube: watch?v=ID, /shorts/ID, /embed/ID, /v/ID, /live/ID, /playlist?list=ID
     if (host === 'youtube.com' || host === 'youtu.be' || host === 'music.youtube.com') {
       const v = parsed.searchParams.get('v');
       if (v) return `youtube:${v}`;
+
+      const list = parsed.searchParams.get('list');
+      if (list && pathname.startsWith('/playlist')) {
+        return `youtube:playlist:${list}`;
+      }
 
       const match = pathname.match(/^\/(?:shorts|embed|v|live)\/([a-zA-Z0-9_-]{11})/);
       if (match) return `youtube:${match[1]}`;
@@ -626,5 +631,43 @@ export async function extractMediaLinksAsync(content) {
   return results;
 }
 
+/**
+ * Checks if a URL is a YouTube playlist or a video that is part of a playlist.
+ * Returns details about the playlist/video.
+ *
+ * @param {string} rawUrl
+ * @returns {{ isPlaylist: boolean, isVideoWithPlaylist: boolean, videoId: string|null, listId: string|null }}
+ */
+export function extractYouTubePlaylistDetails(rawUrl) {
+  const result = { isPlaylist: false, isVideoWithPlaylist: false, videoId: null, listId: null };
+  if (!rawUrl) return result;
 
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase().replace(/^(www\.|m\.)/, '');
 
+    if (host === 'youtube.com' || host === 'music.youtube.com' || host === 'youtu.be') {
+      const v = parsed.searchParams.get('v');
+      const list = parsed.searchParams.get('list');
+
+      if (list) {
+        result.isPlaylist = true;
+        result.listId = list;
+
+        if (v) {
+          result.isVideoWithPlaylist = true;
+          result.videoId = v;
+        } else if (host === 'youtu.be') {
+          // e.g. youtu.be/VIDEO_ID?list=PLAYLIST_ID
+          const id = parsed.pathname.slice(1).split('/')[0];
+          if (id && id.length === 11) {
+            result.isVideoWithPlaylist = true;
+            result.videoId = id;
+          }
+        }
+      }
+    }
+  } catch {}
+
+  return result;
+}

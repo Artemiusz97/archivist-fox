@@ -83,6 +83,22 @@ export async function archiveLocalMedia(sourceFilePath, context = {}) {
       await fs.promises.writeFile(metadataPath, JSON.stringify(metadata, null, 2), 'utf-8');
     }
 
+    // Save associated subtitle files
+    if (context.subtitleFiles && Array.isArray(context.subtitleFiles)) {
+      const videoStem = path.parse(destPath).name;
+      for (const subFile of context.subtitleFiles) {
+        if (fs.existsSync(subFile)) {
+          const subExt = path.extname(subFile).toLowerCase();
+          const subBase = path.basename(subFile, subExt);
+          const match = subBase.match(/(?:^|[._-])([a-zA-Z]{2,3}(?:-[A-Za-z]{2,4})?)(?:-[a-zA-Z0-9_-]+)?$/i);
+          const langSuffix = match ? `.${match[1]}` : subBase.replace(parsed.name, '');
+          
+          const targetSubPath = path.join(targetDir, `${videoStem}${langSuffix}${subExt}`);
+          await fs.promises.copyFile(subFile, targetSubPath).catch(() => {});
+        }
+      }
+    }
+
     console.log(`[Archiver] Preserved high-quality media to ${destPath}`);
     return destPath;
   } catch (err) {

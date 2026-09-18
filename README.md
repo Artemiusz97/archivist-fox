@@ -82,7 +82,19 @@ the media, and replies to the original poster with it as a file attachment.
 | `GPU_ACCELERATION` | `auto` | GPU video compression (`auto`, `nvenc` for NVIDIA, `qsv` for Intel, `amf` for AMD, `off` for CPU) |
 | `ENABLE_AUTO_UPDATE_BINARIES` | `true` | Periodically update yt-dlp & gallery-dl in the background |
 | `AUTO_UPDATE_INTERVAL_HOURS` | `24` | How often (in hours) to check for scraper binary updates |
-| `MAX_CONCURRENT_DOWNLOADS` | `2` | Maximum concurrent media downloads/compressions in the queue |
+| `MAX_CONCURRENT_DOWNLOADS` | `3` | Maximum concurrent media downloads/compressions in the queue |
+| `MAX_QUEUE_DEPTH` | `50` | Maximum number of tasks allowed in the download queue at once |
+| `ENABLE_PLAYLIST_DOWNLOAD` | `true` | Enable fetching and interactive prompting for YouTube playlists |
+| `MAX_PLAYLIST_ITEMS` | `25` | Maximum number of videos to parse and download from a single playlist |
+| `PLAYLIST_AUTO_THREAD` | `true` | Automatically create a thread to post playlist videos to avoid channel clutter |
+| `PLAYLIST_PROMPT_TIMEOUT_SECONDS` | `30` | Timeout in seconds before defaulting to single video download or cancelling |
+| `ENABLE_SUBTITLES` | `true` | Automatically download and archive creator-provided subtitles/captions |
+| `UPLOAD_SUBTITLES_TO_DISCORD` | `false` | Upload subtitle files into Discord (`false` = archive locally on PC only, keeping Discord clean) |
+| `SUBTITLE_SOURCE` | `creator` | Source of subtitles (`creator` or `all` for auto-generated) |
+| `SUBTITLE_LANGS` | `all` | Preferred subtitle languages (`all`, `en`, `en.*,ja`) |
+| `SUBTITLE_FORMAT` | `srt` | Target subtitle format (`srt`, `vtt`) |
+| `ZIP_MULTI_SUBTITLES` | `true` | Zips subtitle files if a video has many language tracks to avoid Discord spam |
+| `MAX_INDIVIDUAL_SUBTITLES` | `3` | Max subtitle files to upload individually before bundling into a .zip archive |
 | `AUTO_SUPPRESS_EMBEDS` | `true` | Automatically suppress the original link's preview embed after uploading media |
 | `ARCHIVE_SUBFOLDER_FORMAT` | `channel/date` | Smart subfolder structure on PC (`channel/date`, `date/channel`, `channel`, `flat`) |
 | `ENABLE_GENERAL_DUPLICATE_DETECTOR` | `true` | Detect when any link (media, news, docs, articles, websites) has been posted before |
@@ -149,6 +161,25 @@ If you don't run the bot 24/7 or turn off your PC at night, the bot automaticall
 - **Channel Whitelist/Blacklist Aware**: Only scans channels allowed by `ALLOWED_CHANNEL_IDS` and excludes any in `DISALLOWED_CHANNEL_IDS`.
 - **Downloads & Reposts**: Saves high-quality original files to your local PC archive (`./archives`), and reposts any missing attachments to Discord for messages that never received bot replies while offline.
 - **Fast History Cutoff**: Stops fetching channel history as soon as it reaches messages older than the time window, saving bandwidth and Discord API limits.
+
+## YouTube Playlists & Auto-Threading
+
+When a YouTube playlist link or video link containing a `&list=` parameter is shared in chat:
+- **Interactive Action Buttons**: Attaches an interactive prompt message with buttons:
+  - `🎬 This Video Only` &mdash; Downloads and processes only the single video link.
+  - `📁 Entire Playlist (N)` &mdash; Downloads and archives the entire playlist batch up to `MAX_PLAYLIST_ITEMS` (default: 25).
+  - `❌ Cancel` &mdash; Dismisses the prompt and cancels downloading.
+- **Permission Guarded**: Only the user who posted the link or server moderators (`Manage Messages`) can interact with the action buttons.
+- **Automatic Thread Isolation (`PLAYLIST_AUTO_THREAD=true`)**: Creates a dedicated Discord thread to upload the playlist videos sequentially, preventing main channel chat spam.
+- **Graceful Timeout**: If no selection is clicked within 30 seconds (`PLAYLIST_PROMPT_TIMEOUT_SECONDS`), the bot automatically defaults to downloading just the single video.
+
+## Subtitle & Caption Extraction
+
+Archivist Fox can automatically capture video subtitles and captions alongside downloads:
+- **Creator & Auto-Captions**: Downloads manual creator-provided captions or YouTube auto-generated captions in `.srt` or `.vtt` format (`SUBTITLE_SOURCE=creator|all`).
+- **Permanent Local Storage**: Subtitles are saved directly into your local `./archives` folder alongside the video file and metadata JSON.
+- **Multi-Language ZIP Bundling (`ZIP_MULTI_SUBTITLES=true`)**: If a video contains more than 3 subtitle tracks (`MAX_INDIVIDUAL_SUBTITLES=3`), the bot bundles them into a single clean `.zip` file before uploading to Discord.
+- **Clean Chat Mode (`UPLOAD_SUBTITLES_TO_DISCORD=false`)**: Keep Discord chat clutter-free by saving subtitles to your PC archive only, or toggle `true` to attach them directly into Discord messages.
 
 ## Retrying a link
 

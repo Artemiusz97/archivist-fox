@@ -14,6 +14,7 @@ import { saveLinkRecord, findDuplicateLink } from './linkDb.js';
 import { ensureWithinLimit, isValidDisplayTitle } from './mediaHandler.js';
 import { applyThumbnailPreview } from './thumbnailPreview.js';
 import { downloadQueue } from './queue.js';
+import { isPlaylistDownloading } from './playlistHandler.js';
 
 let isScanningActive = false;
 let isScanStopRequested = false;
@@ -42,9 +43,11 @@ export function requestScanStop() {
 }
 
 export function stopActiveTasks() {
-  const scanRunning = requestScanStop();
+  const scanRunning = isScanningActive;
+  const playlistRunning = isPlaylistDownloading();
+  isScanStopRequested = true;
   const queueItemsCleared = downloadQueue.clear();
-  return { scanRunning, queueItemsCleared };
+  return { scanRunning, playlistRunning, queueItemsCleared };
 }
 
 /**

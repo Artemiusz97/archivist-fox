@@ -131,6 +131,20 @@ export const config = {
   // Maximum number of tasks allowed in the download queue at once.
   // If the queue is saturated, new tasks are rejected with a polite notice.
   maxQueueDepth: Math.max(5, Number(process.env.MAX_QUEUE_DEPTH || 50)),
+  // YouTube Playlist Support Configuration
+  enablePlaylistDownload: parseBool(process.env.ENABLE_PLAYLIST_DOWNLOAD, true),
+  maxPlaylistItems: Math.max(1, Number(process.env.MAX_PLAYLIST_ITEMS || 25)),
+  playlistAutoThread: parseBool(process.env.PLAYLIST_AUTO_THREAD, true),
+  playlistPromptTimeoutSeconds: Math.max(10, Number(process.env.PLAYLIST_PROMPT_TIMEOUT_SECONDS || 30)),
+
+  // Subtitle/Caption Extraction
+  enableSubtitles: parseBool(process.env.ENABLE_SUBTITLES, true),
+  uploadSubtitlesToDiscord: parseBool(process.env.UPLOAD_SUBTITLES_TO_DISCORD, false),
+  subtitleSource: process.env.SUBTITLE_SOURCE || 'creator', // 'creator' or 'all'
+  subtitleLangs: process.env.SUBTITLE_LANGS || 'all',
+  subtitleFormat: process.env.SUBTITLE_FORMAT || 'srt',
+  zipMultiSubtitles: parseBool(process.env.ZIP_MULTI_SUBTITLES, true),
+  maxIndividualSubtitles: Math.max(1, Number(process.env.MAX_INDIVIDUAL_SUBTITLES || 3)),
 };
 
 export function isChannelAllowed(channelId) {

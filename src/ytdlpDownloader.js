@@ -32,7 +32,7 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
     '--no-check-certificates',
     '--no-warnings',
     '--js-runtimes', 'node',
-    '--extractor-args', 'youtube:player_client=android_creator,android,web,ios',
+    '--extractor-args', 'youtube:player_client=web,default',
     '--max-filesize', `${hardCapMB}M`,
   ];
 
@@ -66,6 +66,17 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
     if (config.embedThumbnail || config.prependThumbnailPreview) {
       args.push('--convert-thumbnails', 'jpg');
     }
+  }
+
+  // --- Caption / Subtitle Extraction ---
+  if (config.enableSubtitles && (url.includes('youtube.com') || url.includes('youtu.be'))) {
+    if (config.subtitleSource === 'all') {
+      args.push('--write-sub', '--write-auto-subs');
+    } else {
+      args.push('--write-sub');
+    }
+    args.push('--sub-langs', config.subtitleLangs || 'all');
+    args.push('--convert-subs', config.subtitleFormat || 'srt');
   }
 
   if (config.ffmpegPath && fs.existsSync(config.ffmpegPath)) {
@@ -127,9 +138,15 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
     '.mp3', '.m4a', '.opus', '.ogg', '.flac', '.wav', '.aac', '.alac', '.aiff'
   ]);
   const mediaFiles = filePaths.filter((f) => mediaExtensions.has(path.extname(f).toLowerCase()));
-  const candidateFiles = mediaFiles.length > 0 ? mediaFiles : filePaths;
+  const subtitleFiles = filePaths.filter((f) => {
+    const ext = path.extname(f).toLowerCase();
+    return ext === '.srt' || ext === '.vtt' || ext === '.ass';
+  });
 
-  return mergeOrphanedAudioVideo(candidateFiles, destDir);
+  const candidateFiles = mediaFiles.length > 0 ? mediaFiles : filePaths;
+  const mergedMedia = await mergeOrphanedAudioVideo(candidateFiles, destDir);
+
+  return { mediaFiles: mergedMedia, subtitleFiles };
 }
 
 function runProcess(cmd, args) {
@@ -164,4 +181,96 @@ function runProcess(cmd, args) {
       }
     });
   });
+}
+
+function runProcessWithStdout(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+
+    const timer = setTimeout(() => {
+      killProcessTree(child);
+      reject(new Error(`TIMEOUT: ${cmd} took too long`));
+    }, 30000); // Shorter timeout for flat playlist extraction
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      if (err.code === 'ENOENT') {
+        reject(new Error(`COMMAND_NOT_FOUND: ${cmd} is not installed or not on PATH`));
+      } else {
+        reject(err);
+      }
+    });
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve(stdout);
+      } else {
+        reject(new Error(`${cmd} exited with code ${code}: ${stderr.trim()}`));
+      }
+    });
+  });
+}
+
+/**
+ * Extracts flat playlist metadata without downloading media.
+ */
+export async function fetchFlatPlaylistInfo(url, maxItems = 25) {
+  const args = [
+    url,
+    '--flat-playlist',
+    '--playlist-end', `${maxItems}`,
+    '--dump-single-json',
+    '--no-warnings',
+    '--no-check-certificates',
+    '--js-runtimes', 'node',
+  ];
+
+  // Apply impersonation/cookies exactly like the download pipeline
+  let impersonateTarget = config.impersonateBrowser;
+  if (impersonateTarget === 'auto') {
+    if (config.cookiesFromBrowser) {
+      const lower = config.cookiesFromBrowser.toLowerCase();
+      if (lower.includes('firefox')) impersonateTarget = 'firefox';
+      else if (lower.includes('edge')) impersonateTarget = 'edge';
+      else if (lower.includes('safari')) impersonateTarget = 'safari';
+      else impersonateTarget = 'chrome';
+    } else {
+      impersonateTarget = 'chrome';
+    }
+  }
+  const isImpersonateDisabled = !impersonateTarget || ['off', 'none', 'false'].includes(impersonateTarget);
+  if (!isImpersonateDisabled) {
+    args.push('--impersonate', impersonateTarget);
+  }
+  const activeBrowserType = !isImpersonateDisabled ? impersonateTarget : config.cookiesFromBrowser || 'chrome';
+  args.push('--user-agent', getBrowserUserAgent(activeBrowserType));
+
+  const cookiePath = getCookieForUrl(url);
+  if (config.cookiesFromBrowser) {
+    if (config.preferBrowserCookies || !cookiePath || !fs.existsSync(cookiePath)) {
+      args.push('--cookies-from-browser', config.cookiesFromBrowser);
+    } else {
+      args.push('--cookies', cookiePath);
+    }
+  } else if (cookiePath && fs.existsSync(cookiePath)) {
+    args.push('--cookies', cookiePath);
+  }
+
+  const output = await runProcessWithStdout(config.ytdlpPath, args);
+  try {
+    return JSON.parse(output.trim());
+  } catch (err) {
+    throw new Error('Failed to parse yt-dlp playlist JSON');
+  }
 }

@@ -23,6 +23,7 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 
 | Version | Release Date | Type | Primary Milestone / Theme |
 | :--- | :--- | :--- | :--- |
+| **[v3.9.0](#v390---2026-09-18)** | 2026-09-18 | Minor | YouTube Playlist & Subtitle Suite: Interactive playlist prompt buttons, auto-threading, creator/auto-generated subtitle extraction & zip bundling. |
 | **[v3.8.0](#v380---2026-09-17)** | 2026-09-17 | Minor | DeviantArt Platform Expansion: Native DeviantArt & Sta.sh scraping, fav.me base-36 canonical unshortening, gallery-dl fast-path routing, DeviantArt cookie vault. |
 | **[v3.7.0](#v370---2026-09-16)** | 2026-09-16 | Minor | Message Deletion Fallback, Context Menu Channel-Gating, Faststart Streaming & Live Telemetry. |
 | **[v3.6.1](#v361---2026-09-16)** | 2026-09-16 | Patch | Production Hardening Suite: Gateway exponential backoff, Anti-bot browser impersonation & human jitter, SQLite prepared statement cache & WAL tuning, Queue flood protection, Windows NTFS reserved name defense. |
@@ -48,6 +49,18 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 ---
 
 ## Release Details
+
+### [v3.9.0] - 2026-09-18
+
+#### Added & Improved
+- **Interactive YouTube Playlists (`src/playlistHandler.js`)**:
+  - Interactive Discord action buttons (`🎬 This Video Only`, `📁 Entire Playlist (N)`, `❌ Cancel`) with author/moderator permission gating.
+  - Automatic Discord thread creation (`PLAYLIST_AUTO_THREAD=true`) to host playlist video batches and keep main channels clean.
+  - Configurable item limits (`MAX_PLAYLIST_ITEMS=25`) and prompt timeouts (`PLAYLIST_PROMPT_TIMEOUT_SECONDS=30`).
+- **Subtitle & Caption Extraction Engine (`src/ytdlpDownloader.js`, `src/archiver.js`, `src/mediaHandler.js`)**:
+  - Automatically downloads creator-provided and auto-generated captions (.srt, .vtt) and archives them side-by-side on PC in `./archives`.
+  - Configurable Discord chat upload toggle (`UPLOAD_SUBTITLES_TO_DISCORD=false`).
+  - Automatically bundles multi-language subtitle tracks into a `.zip` when exceeding 3 tracks (`ZIP_MULTI_SUBTITLES=true`).
 
 ### [v3.8.0] - 2026-09-17
 
