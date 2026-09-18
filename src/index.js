@@ -153,14 +153,15 @@ client.on('messageCreate', async (message) => {
       }
 
       const stopped = stopActiveTasks();
-      if (stopped.scanRunning || stopped.queueItemsCleared > 0) {
+      if (stopped.scanRunning || stopped.playlistRunning || stopped.queueItemsCleared > 0) {
         let msg = '🛑 **Stopped active tasks:**\n';
         if (stopped.scanRunning) msg += '• Aborted active channel rescan / media crawl.\n';
+        if (stopped.playlistRunning) msg += '• Aborted active playlist download.\n';
         if (stopped.queueItemsCleared > 0) msg += `• Cleared **${stopped.queueItemsCleared}** queued download(s).\n`;
         await message.reply({ content: msg, allowedMentions: { repliedUser: false } });
       } else {
         const notice = await message.reply({
-          content: 'ℹ️ No active rescan or queued download tasks are currently running.',
+          content: 'ℹ️ No active rescan, playlist download, or queued tasks are currently running.',
           allowedMentions: { repliedUser: false },
         });
         scheduleAutoDelete(notice);
