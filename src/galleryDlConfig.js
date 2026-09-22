@@ -44,6 +44,12 @@ export async function getGalleryDlConfigPath() {
     gdlConfig.extractor.reddit = redditConfig;
   }
 
+  if (config.pixivRefreshToken) {
+    gdlConfig.extractor.pixiv = {
+      'refresh-token': config.pixivRefreshToken,
+    };
+  }
+
   const instagramConfig = { videos: true };
   const igCookies = getCookieForUrl('https://www.instagram.com');
   if (igCookies) {

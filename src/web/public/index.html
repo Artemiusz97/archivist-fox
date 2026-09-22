@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Archivist Fox - Direct Media Downloader</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220%200%20100%20100%22><text y=%22.9em%22 font-size=%2290%22>🦊</text></svg>">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="header">
+      <div class="header-brand">
+        <span class="brand-icon">🦊</span>
+        <div class="brand-text">
+          <h1>Archivist Fox</h1>
+          <span class="brand-subtitle">Direct Media Downloader & Archiver</span>
+        </div>
+        <span class="badge version-badge" id="versionBadge">v3.9.0</span>
+      </div>
+
+      <nav class="nav-tabs">
+        <button class="tab-btn active" data-tab="downloadTab">
+          <span class="tab-icon">📥</span> Download
+        </button>
+        <button class="tab-btn" data-tab="libraryTab">
+          <span class="tab-icon">📚</span> Archive Library
+        </button>
+      </nav>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main-content">
+      <!-- Tab 1: Download -->
+      <section id="downloadTab" class="tab-pane active">
+        <div class="card download-card">
+          <div class="card-header">
+            <h2>Download Media from Link</h2>
+            <p class="text-muted">Supports Twitter/X, YouTube, TikTok, Reddit, Instagram, Pixiv, DeviantArt, and direct file URLs.</p>
+          </div>
+
+          <form id="downloadForm" class="download-form">
+            <div class="input-group">
+              <input
+                type="url"
+                id="urlInput"
+                class="url-input"
+                placeholder="Paste media link here (e.g. https://x.com/..., https://youtube.com/watch?v=...)"
+                required
+                autocomplete="off"
+              />
+              <button type="button" id="pasteBtn" class="btn btn-secondary" title="Paste from clipboard">
+                📋 Paste
+              </button>
+              <button type="submit" id="submitBtn" class="btn btn-primary">
+                <span class="btn-text">Download</span>
+                <span class="btn-spinner hidden">⏳</span>
+              </button>
+            </div>
+
+            <div class="options-row">
+              <label class="toggle-label" title="Extract and download audio as MP3">
+                <input type="checkbox" id="audioOnlyToggle">
+                <span class="toggle-switch"></span>
+                <span>🎵 Audio Only (MP3)</span>
+              </label>
+
+              <label class="toggle-label" title="Bypass duplicate detection and download anyway">
+                <input type="checkbox" id="forceToggle">
+                <span class="toggle-switch"></span>
+                <span>⚡ Force Re-download</span>
+              </label>
+
+              <label class="toggle-label" title="Permanently store uncompressed copy in local PC archive directory">
+                <input type="checkbox" id="archiveToggle" checked>
+                <span class="toggle-switch"></span>
+                <span>💾 Save to PC Archive</span>
+              </label>
+            </div>
+          </form>
+        </div>
+
+        <!-- Live Tasks Section -->
+        <div class="tasks-container">
+          <div class="section-title-row">
+            <h3>Active & Recent Downloads</h3>
+            <div class="section-actions">
+              <button id="openArchiveFolderBtn" class="btn btn-sm btn-secondary" title="Open download directory in File Explorer">
+                📂 Open Download Directory
+              </button>
+              <button id="clearCompletedBtn" class="btn btn-sm btn-ghost">Clear Finished</button>
+            </div>
+          </div>
+          <div id="tasksList" class="tasks-list">
+            <div class="empty-state" id="emptyTasks">
+              <span class="empty-icon">📂</span>
+              <p>No active downloads yet. Paste a link above to get started!</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tab 2: Archive Library -->
+      <section id="libraryTab" class="tab-pane">
+        <div class="card library-card">
+          <div class="library-header">
+            <div class="search-box">
+              <input
+                type="text"
+                id="librarySearchInput"
+                placeholder="Search archived media by title or URL..."
+                autocomplete="off"
+              />
+              <button id="librarySearchBtn" class="btn btn-secondary">🔍 Search</button>
+            </div>
+            <div class="header-actions">
+              <button id="openLibraryFolderBtn" class="btn btn-secondary" title="Open archive directory in File Explorer">
+                📂 Open Directory
+              </button>
+              <button id="refreshLibraryBtn" class="btn btn-secondary">🔄 Refresh</button>
+            </div>
+          </div>
+
+          <div id="libraryList" class="library-grid">
+            <div class="empty-state">
+              <span class="empty-icon">⏳</span>
+              <p>Loading library...</p>
+            </div>
+          </div>
+
+          <div class="pagination-row">
+            <button id="prevPageBtn" class="btn btn-secondary btn-sm" disabled>◀ Previous</button>
+            <span id="pageInfo" class="text-muted">Page 1</span>
+            <button id="nextPageBtn" class="btn btn-secondary btn-sm">Next ▶</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Modal for In-Browser Media Preview -->
+    <div id="previewModal" class="modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3 id="modalTitle">Media Preview</h3>
+          <button id="closeModalBtn" class="btn-close">&times;</button>
+        </div>
+        <div id="modalBody" class="modal-body">
+          <!-- Video or Audio injected here -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <p>Archivist Fox &bull; High-Quality Local Media Archiver &bull; Running on your local machine</p>
+    </footer>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

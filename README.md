@@ -67,9 +67,16 @@ the media, and replies to the original poster with it as a file attachment.
 | `YTDLP_PATH` / `GALLERYDL_PATH` / `FFMPEG_PATH` / `FFPROBE_PATH` | on PATH | Override if those binaries aren't on your system PATH |
 | `ERROR_MESSAGE_TTL_SECONDS` | `0` | Auto-delete error/status messages after this many seconds. `0` = never delete |
 | `RETRY_COMMAND` | `!repost` | Reply to a message with a link and send this to retry it (see below) |
+| `REUP_COMMAND` | `!reup` | Reply to a message to force re-upload media, bypassing duplicate checks |
+| `AUTO_DELETE_COMMAND_MESSAGES` | `true` | Automatically delete user command messages (`!repost`, `!reup`, `!rescan`, etc.) |
+| `COMMAND_MESSAGE_TTL_SECONDS` | `4` | Delay in seconds before deleting user command messages |
 | `INCLUDE_TITLE_IN_MESSAGE` | `true` | Include the original media/post title in the bot's reply |
 | `EMBED_THUMBNAIL` | `true` | Embed thumbnail artwork into downloaded video files via ffmpeg |
 | `PREPEND_THUMBNAIL_PREVIEW` | `true` | Inject a 0.15s frozen thumbnail frame into videos to ensure instant Discord video player previews |
+| `AUTO_SPOILER_NSFW` | `true` | Automatically spoiler NSFW/adult media from known domains or metadata flags |
+| `SPOILER_NON_NSFW_CHANNELS_ONLY` | `true` | Only apply spoilers in regular channels (allows NSFW channels to display unspoilered) |
+| `SPOILER_USER_FLAGGED_LINKS` | `true` | Automatically spoiler attachments if the user typed their link inside `\|\|...\|\|` |
+| `SPOILER_TITLES` | `true` | Format message titles as `\|\|**Title**\|\|` when attachments are spoilered |
 | `ENABLE_AUDIO_EXTRACTION` | `true` | Extract and process audio tracks from SoundCloud, Bandcamp, YouTube Music, etc. |
 | `AUDIO_FORMAT` | `mp3` | Target audio format for downloaded songs/tracks |
 | `AUDIO_QUALITY` | `0` | VBR audio quality (`0` = highest quality / ~320kbps) |
@@ -111,10 +118,14 @@ the media, and replies to the original poster with it as a file attachment.
 | `AUTO_SCAN_CONCURRENCY` | `3` | Number of parallel download workers during the startup catch-up scan |
 | `COOKIES_FROM_BROWSER` | `firefox` | Directly read login cookies from your local browser (`firefox`, `chrome`, `edge`, `brave`) |
 | `PREFER_BROWSER_COOKIES` | `false` | Prioritize browser cookies over manual cookie files in `./cookies` |
+| `PIXIV_REFRESH_TOKEN` | — | Pixiv OAuth refresh token (auto-cached by `pixiv_login.bat`) |
 | `IMPERSONATE_BROWSER` | `auto` | Mimic real browser fingerprint (`auto`, `chrome`, `firefox`, `edge`, `safari`, `off`) to bypass anti-bot blocks |
 | `ENABLE_HUMAN_JITTER` | `true` | Add subtle randomized delays between download requests to prevent rate limits |
 | `HUMAN_JITTER_MIN_MS` | `1500` | Minimum delay in milliseconds for human jitter |
 | `HUMAN_JITTER_MAX_MS` | `3500` | Maximum delay in milliseconds for human jitter |
+| `ENABLE_WEB_UI` | `true` | Launch the browser-based Web Downloader & Dashboard on startup |
+| `WEB_PORT` | `3000` | Port for the Web UI server |
+| `WEB_HOST` | `0.0.0.0` | Host binding for Web UI (`0.0.0.0` allows LAN access, `127.0.0.1` for local only) |
 
 ## Slash Commands & Context Menu Apps
 
@@ -133,8 +144,8 @@ Archivist Fox includes modern Discord Application Commands:
   - Prefix command equivalent: `!rescan 500 --repost-missing -c 4` (use `-c` or `--concurrency` to control parallel download speed).
 - **`/stop`**:
   - Immediately aborts and halts any running `/rescan` channel crawl, bulk archiving session, or queued background tasks.
-- **Duplicate Notice "Dismiss" Button**:
-  - When the bot sends an alert that a link has already been posted, a `🗑️ Dismiss` button is attached. The original poster or server moderators can click it to immediately clear the alert and keep chat clean.
+- **Duplicate Notice "Delete Post" & "Dismiss" Buttons**:
+  - When all links in a message are duplicates, the bot attaches both a `🗑️ Delete Post` button and a `✖️ Dismiss` button. The original poster or server moderators can delete the duplicate message and alert in one click.
 
 ## Re-scanning & Bulk Archiving (`!rescan` / `!crawl` / `!repost-missing`)
 
@@ -181,9 +192,42 @@ Archivist Fox can automatically capture video subtitles and captions alongside d
 - **Multi-Language ZIP Bundling (`ZIP_MULTI_SUBTITLES=true`)**: If a video contains more than 3 subtitle tracks (`MAX_INDIVIDUAL_SUBTITLES=3`), the bot bundles them into a single clean `.zip` file before uploading to Discord.
 - **Clean Chat Mode (`UPLOAD_SUBTITLES_TO_DISCORD=false`)**: Keep Discord chat clutter-free by saving subtitles to your PC archive only, or toggle `true` to attach them directly into Discord messages.
 
-## Retrying a link
+## Web Dashboard & Direct Downloader
 
-If a link was posted while the bot wasn't running (or a download failed), reply to that message with `!repost` (or whatever `RETRY_COMMAND` is set to). The bot re-runs the download/upload pipeline on the message you replied to and reacts with ✅ or ❌ so you get quiet feedback without extra clutter.
+Archivist Fox includes a built-in browser-based control center and media player:
+- **How to Launch**:
+  - Double-click `run_web.bat` (or run `npm run web`), or set `ENABLE_WEB_UI=true` in `.env` to start automatically alongside the Discord bot.
+- **Access**: Open `http://localhost:3000` (or your configured `WEB_PORT`) in any browser.
+- **Features**:
+  - **Direct Downloader**: Paste any supported media link into the web input to download and archive immediately with real-time SSE progress indicators (`checking`, `downloading`, `processing`, `archiving`).
+  - **Integrated Archive Explorer**: Browse your local `./archives` library with responsive image, video, and audio players.
+  - **Windows Explorer Shortcut**: Click the folder icon to instantly reveal any downloaded file in your Windows file manager.
+  - **Live Telemetry & Diagnostics**: View live database link counts, active download queue depths, and archive disk usage.
+
+## Auto-Spoiler System (NSFW & Sensitive Media)
+
+Keep your Discord server clean and compliant with automatic spoiler tagging:
+- **Domain & Platform Detection**: Automatically flags links from known adult/NSFW platforms (e.g. RedGifs, Danbooru, Gelbooru, etc.).
+- **Deep Metadata Inspection**: Automatically checks yt-dlp (`age_limit >= 18`) and gallery-dl metadata (`is_mature`, `r-18`, `nsfw`) to spoiler age-gated content.
+- **In-Chat User Spoiler Syntax**: If a user posts their link inside spoiler tags (`||https://...||`), the bot automatically marks the downloaded file attachments as spoilers too (`SPOILER_USER_FLAGGED_LINKS=true`).
+- **Spoilered Titles (`SPOILER_TITLES=true`)**: Formats titles as `||**Title**||` when attachments are spoilered.
+- **Smart Channel Scoping (`SPOILER_NON_NSFW_CHANNELS_ONLY=true`)**: Regular channels receive spoilers, while age-restricted/NSFW channels display media unspoilered unless explicitly spoilered by the user.
+
+## Pixiv OAuth Authentication
+
+To download high-resolution Pixiv illustrations and multi-image manga works without manual cookie extraction:
+1. Double-click `pixiv_login.bat` (or run `npm run pixiv-login`).
+2. Follow the prompt in your browser to log into Pixiv, right-click the login button, copy the callback URL, and paste it back into the terminal.
+3. The script automatically writes `PIXIV_REFRESH_TOKEN` to `.env` and configures gallery-dl.
+4. For detailed step-by-step instructions, see [`PIXIV_LOGIN_GUIDE.txt`](PIXIV_LOGIN_GUIDE.txt).
+
+## Retrying and Re-uploading links
+
+### Standard Retry (`!repost` / `!retry`)
+If a link was posted while the bot wasn't running (or a download failed), reply to that message with `!repost` (or whatever `RETRY_COMMAND` is set to). The bot re-runs the download/upload pipeline on the message you replied to and reacts with ✅ or ❌ so you get quiet feedback without extra clutter. If duplicate prevention is enabled, it will still skip already-archived media.
+
+### Force Re-upload (`!reup` / `!retry --force`)
+If you explicitly want the bot to upload a piece of media that it previously archived or flagged as a duplicate, reply to the message with `!reup` (or `!reupload`, `!force`, or `!retry --force`). This overrides duplicate detection and forces the bot to upload the attachment. As a bonus, if the bot finds the pristine original file in your local `ARCHIVE_DIRECTORY`, it will instantly use it to save bandwidth and skip re-downloading!
 
 Sending `!repost` without replying to anything gets you a short reminder of how to use it.
 

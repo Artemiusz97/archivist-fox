@@ -1,0 +1,78 @@
+==============================================================================
+ ARCHIVIST FOX - HOW TO LOG IN TO PIXIV (BEGINNER'S GUIDE)
+==============================================================================
+
+Pixiv requires an authorization token so Archivist Fox and gallery-dl can 
+download high-resolution artwork without getting blocked.
+
+You only need to do this ONCE. Follow these simple steps:
+
+------------------------------------------------------------------------------
+STEP 1: Run the Pixiv Login Shortcut
+------------------------------------------------------------------------------
+Double-click "pixiv_login.bat" in this folder.
+(Or open a terminal here and run: npm run pixiv-login)
+
+A black terminal window will appear and open your web browser to Pixiv.
+
+
+------------------------------------------------------------------------------
+STEP 2: Open the "Developer Tools" in Your Browser
+------------------------------------------------------------------------------
+BEFORE you click login or enter your password:
+
+1. Press F12 on your keyboard.
+   (If your keyboard has an Fn key, you may need to press Fn + F12.
+    Alternatively, right-click anywhere empty on the webpage and click "Inspect").
+
+2. A developer panel will appear on the side or bottom of your browser window.
+
+3. Look at the top menu of this developer panel and click on the "Network" tab.
+   (It will say Elements/Inspector, Console, Sources/Debugger, NETWORK, etc.)
+
+4. [HELPFUL TIP]: Near the top of the Network tab, look for a checkbox called
+   "Preserve log" (in Edge/Chrome) or "Persist Logs" (in Firefox) and check it.
+   This prevents the log from clearing when the page redirects.
+
+
+------------------------------------------------------------------------------
+STEP 3: Log In to Your Pixiv Account
+------------------------------------------------------------------------------
+Now, on the main webpage:
+- If you are already logged in: Click "Continue as [Your Account]" or select it.
+- If prompted: Type in your email/username and password, and sign in.
+
+
+------------------------------------------------------------------------------
+STEP 4: Copy the Callback Link
+------------------------------------------------------------------------------
+After you sign in, the browser will attempt to redirect to an app link:
+
+1. Look back at the "Network" tab that you opened in Step 2.
+2. At the top of the Network tab, there is a "Filter" search box.
+   Type "callback" into that box.
+3. You will see an entry named "callback?state=..." or "login?code=..."
+   (It might be colored red or say "canceled" - that is completely normal because
+   your desktop computer doesn't have the Pixiv mobile phone app installed).
+4. RIGHT-CLICK on that entry:
+   - Select: Copy -> Copy URL (or "Copy link address").
+
+(Alternatively: If your browser's address bar shows a link starting with 
+ "pixiv://account/login?code=...", you can simply copy that entire address bar!)
+
+
+------------------------------------------------------------------------------
+STEP 5: Paste and Press Enter
+------------------------------------------------------------------------------
+1. Switch back to the black terminal window.
+2. Right-click inside the window (or press Ctrl + V) to paste what you copied.
+3. Press Enter.
+
+That's it!
+You will see:
+[success] Logged in as Pixiv user: ...
+[success] Saved to gallery-dl cache
+[success] Saved to .env (PIXIV_REFRESH_TOKEN)
+
+Archivist Fox is now fully authorized and ready to download Pixiv links!
+==============================================================================

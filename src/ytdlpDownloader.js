@@ -5,7 +5,7 @@ import { config } from './config.js';
 import { mergeOrphanedAudioVideo } from './streamMerge.js';
 import { getCookieForUrl } from './cookieVault.js';
 import { killProcessTree, getBrowserUserAgent } from './utils.js';
-import { isAudioUrl } from './urlExtractor.js';
+import { isAudioUrl, checkNsfwInMetadata } from './urlExtractor.js';
 
 const TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes (allows buffer for large downloads and rate-limits)
 
@@ -34,6 +34,7 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
     '--js-runtimes', 'node',
     '--extractor-args', 'youtube:player_client=web,default',
     '--max-filesize', `${hardCapMB}M`,
+    '--write-info-json',
   ];
 
   const shouldExtractAudio = config.enableAudioExtraction && (options.extractAudio || isAudioUrl(url));
@@ -143,10 +144,24 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
     return ext === '.srt' || ext === '.vtt' || ext === '.ass';
   });
 
-  const candidateFiles = mediaFiles.length > 0 ? mediaFiles : filePaths;
+  const candidateFiles = mediaFiles.length > 0 ? mediaFiles : filePaths.filter((f) => !f.endsWith('.json'));
   const mergedMedia = await mergeOrphanedAudioVideo(candidateFiles, destDir);
 
-  return { mediaFiles: mergedMedia, subtitleFiles };
+  // Check .info.json for NSFW / age restriction
+  let isNsfw = false;
+  const jsonFiles = filePaths.filter((f) => f.endsWith('.info.json') || f.endsWith('.json'));
+  for (const jsonPath of jsonFiles) {
+    try {
+      const raw = await fs.promises.readFile(jsonPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (checkNsfwInMetadata(parsed)) {
+        isNsfw = true;
+        break;
+      }
+    } catch {}
+  }
+
+  return { mediaFiles: mergedMedia, subtitleFiles, isNsfw };
 }
 
 function runProcess(cmd, args) {

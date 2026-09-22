@@ -2,7 +2,7 @@ import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, ChannelTyp
 import { config } from './config.js';
 import { fetchFlatPlaylistInfo } from './ytdlpDownloader.js';
 import { handleMessage } from './mediaHandler.js';
-import { isStopRequested } from './scanner.js';
+import { isStopRequested, clearStopRequested } from './scanner.js';
 import { scheduleAutoDelete, getHumanJitterMs } from './utils.js';
 
 let activePlaylistJob = false;
@@ -30,7 +30,10 @@ export async function handlePlaylistPromptAndDownload(message, rawUrl, details, 
   } catch (err) {
     console.error('[Playlist] Failed to fetch playlist info:', err);
     if (loadingMsg) {
-      await loadingMsg.edit('❌ Failed to fetch playlist information. Proceeding with single video download...').catch(() => {});
+      const errMsg = details.isVideoWithPlaylist
+        ? '❌ Failed to fetch playlist information. Proceeding with single video download...'
+        : '❌ Failed to fetch playlist information (the playlist may be private, empty, or invalid).';
+      await loadingMsg.edit(errMsg).catch(() => {});
       scheduleAutoDelete(loadingMsg, 5000);
     }
     // Fallback to single video download if applicable, else exit
@@ -112,6 +115,7 @@ export async function handlePlaylistPromptAndDownload(message, rawUrl, details, 
 
 async function downloadAndPostPlaylist(message, playlistInfo, options) {
   activePlaylistJob = true;
+  clearStopRequested();
   let targetChannel = null;
 
   if (config.playlistAutoThread && !message.channel.isThread() && message.channel.type !== ChannelType.DM) {
@@ -149,11 +153,16 @@ async function downloadAndPostPlaylist(message, playlistInfo, options) {
       // We intercept the reply method for the mock message so if safeReply is called without overrideChannel, it doesn't double-reply to the original prompt
       mockMessage.reply = (opts) => (targetChannel || message.channel).send(opts);
 
-      const result = await handleMessage(mockMessage, { ...options, ignorePlaylists: true, overrideChannel: targetChannel });
-      
-      if (result && result.uploaded > 0) {
-        successCount += result.uploaded;
-      } else {
+      try {
+        const result = await handleMessage(mockMessage, { ...options, ignorePlaylists: true, overrideChannel: targetChannel });
+        
+        if (result && result.uploaded > 0) {
+          successCount += result.uploaded;
+        } else {
+          failCount++;
+        }
+      } catch (itemErr) {
+        console.error(`[Playlist] Error downloading video ${index + 1} (${videoUrl}):`, itemErr);
         failCount++;
       }
 

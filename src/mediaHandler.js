@@ -1,9 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { AttachmentBuilder } from 'discord.js';
+import { AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import { config } from './config.js';
-import { extractMediaLinksAsync, extractPlatformMediaId, normalizeUrl, isAudioUrl, isDeviantArtUrl, extractYouTubePlaylistDetails } from './urlExtractor.js';
+import { extractMediaLinksAsync, extractPlatformMediaId, normalizeUrl, isAudioUrl, isDeviantArtUrl, extractYouTubePlaylistDetails, isKnownNsfwUrl } from './urlExtractor.js';
 import { downloadDirect } from './directDownloader.js';
 import { downloadWithYtDlp } from './ytdlpDownloader.js';
 import { downloadWithGalleryDl } from './galleryDlDownloader.js';
@@ -123,7 +123,8 @@ export async function ensureWithinLimit(filePath, onStatus, thumbPath = null) {
  */
 async function processMessage(message, links, options = {}, onStatus) {
   const tempDir = await makeTempDir();
-  const attachments = [];
+  let totalUploaded = 0;
+  let hasSuppressedEmbeds = false;
   const failures = [];
 
   const notifiedDuplicateMedia = new Set();
@@ -140,33 +141,54 @@ async function processMessage(message, links, options = {}, onStatus) {
 
         const workPromise = (async () => {
           // If general link detector already flagged this URL as duplicate, skip download/upload
-          const isDuplicateLink =
+          const isDuplicateLink = !options.force && (
             (options.duplicateNormalizedSet && normalized && options.duplicateNormalizedSet.has(normalized)) ||
             (Array.isArray(options.duplicateUrls) &&
               options.duplicateUrls.some(
                 (d) => (d.normalizedUrl && d.normalizedUrl === normalized) || d.originalUrl === link.url
-              ));
+              ))
+          );
           if (isDuplicateLink) {
             return;
           }
 
+          let localArchiveCandidate = null;
+
           // Fast Pre-Download Duplicate Check (Platform Media ID / URL match)
-          if (config.enableDuplicatePrevention) {
+          if (config.enableDuplicatePrevention || options.force) {
             const urlMatch = await findDuplicateByUrl(link.url);
             if (urlMatch) {
-              const matchKey = urlMatch.mediaId || urlMatch.originalUrl || link.url;
-              if (!notifiedDuplicateMedia.has(matchKey)) {
-                notifiedDuplicateMedia.add(matchKey);
-                console.log(
-                  `[Duplicate Detector] Duplicate found (Platform Media ID (${urlMatch.mediaId || link.url}))! Originally posted by @${urlMatch.postedBy} in #${urlMatch.channel}`
-                );
-                const dupNotice = await safeReply(message, {
-                  content: `ℹ️ This media was already posted by **@${urlMatch.postedBy}** in **#${urlMatch.channel}**!`,
-                  allowedMentions: { repliedUser: false },
-                }, options.overrideChannel);
-                scheduleAutoDelete(dupNotice);
+              if (options.force && urlMatch.fileName) {
+                // If force-reuploading, try to find the pristine local archive copy to save bandwidth
+                const rootDir = path.resolve(config.archiveDirectory);
+                try {
+                  const entries = await fs.promises.readdir(rootDir, { recursive: true, withFileTypes: true });
+                  const found = entries.find(e => e.isFile() && e.name === urlMatch.fileName);
+                  if (found) {
+                    const foundPath = path.join(found.path || found.parentPath, found.name);
+                    const destPath = path.join(tempDir, found.name);
+                    await fs.promises.copyFile(foundPath, destPath);
+                    localArchiveCandidate = destPath;
+                    console.log(`[Reup] ⚡ Found local archive copy: ${found.name}, skipping re-download.`);
+                  }
+                } catch (err) {
+                  console.error('[Reup] Could not search local archive:', err.message);
+                }
+              } else if (!options.force) {
+                const matchKey = urlMatch.mediaId || urlMatch.originalUrl || link.url;
+                if (!notifiedDuplicateMedia.has(matchKey)) {
+                  notifiedDuplicateMedia.add(matchKey);
+                  console.log(
+                    `[Duplicate Detector] Duplicate found (Platform Media ID (${urlMatch.mediaId || link.url}))! Originally posted by @${urlMatch.postedBy} in #${urlMatch.channel}`
+                  );
+                  const dupNotice = await safeReply(message, {
+                    content: `ℹ️ This media was already posted by **@${urlMatch.postedBy}** in **#${urlMatch.channel}**!`,
+                    allowedMentions: { repliedUser: false },
+                  }, options.overrideChannel);
+                  scheduleAutoDelete(dupNotice);
+                }
+                return; // Skip downloading and processing this already-archived post entirely
               }
-              return; // Skip downloading and processing this already-archived post entirely
             }
           }
 
@@ -174,15 +196,29 @@ async function processMessage(message, links, options = {}, onStatus) {
             await onStatus('downloading');
           }
 
-          const dlResult = link.type === 'direct'
-            ? [await downloadDirect(link.url, tempDir, config.hardCapBytes)]
-            : await downloadPlatformLink(link.url, tempDir, 2, options);
+          let dlResult;
+          if (localArchiveCandidate) {
+            dlResult = [localArchiveCandidate];
+          } else {
+            dlResult = link.type === 'direct'
+              ? [await downloadDirect(link.url, tempDir, config.hardCapBytes)]
+              : await downloadPlatformLink(link.url, tempDir, 2, options);
+          }
 
           const filePaths = Array.isArray(dlResult) ? dlResult : (dlResult.mediaFiles || []);
           const subtitleFiles = Array.isArray(dlResult) ? [] : (dlResult.subtitleFiles || []);
+          const isDownloadedNsfw = Boolean(dlResult?.isNsfw);
+
+          // Determine if media should be spoilered
+          const isUserSpoiler = Boolean(link.isSpoiler && config.spoilerUserFlaggedLinks);
+          const isNsfwMedia = Boolean((isDownloadedNsfw || link.isKnownNsfw || isKnownNsfwUrl(link.url)) && config.autoSpoilerNsfw);
+          const isChannelNsfw = Boolean(message.channel?.nsfw);
+          const shouldSpoilerNsfw = isNsfwMedia && (!config.spoilerNonNsfwChannelsOnly || !isChannelNsfw);
+          const shouldSpoiler = isUserSpoiler || shouldSpoilerNsfw;
 
           const currentMediaId = extractPlatformMediaId(link.url);
           const postRecordsToSave = [];
+          const linkAttachments = [];
 
           for (const filePath of filePaths) {
             const authorTag = message.author?.tag || message.author?.username || 'Unknown';
@@ -194,7 +230,7 @@ async function processMessage(message, links, options = {}, onStatus) {
             const fingerprint = await computeMediaFingerprint(filePath, link.url);
 
             // Check for duplicate visual media against older posts (ignoring items from this same post)
-            if (config.enableDuplicatePrevention) {
+            if (config.enableDuplicatePrevention && !options.force) {
               const { match, reason, distance } = await findDuplicate(fingerprint, {
                 ignoreMediaId: currentMediaId,
                 ignoreOriginalUrl: link.url,
@@ -206,10 +242,30 @@ async function processMessage(message, links, options = {}, onStatus) {
                   console.log(
                     `[Duplicate Detector] Duplicate found (${reason || `dist=${distance}`})! Originally posted by @${match.postedBy} in #${match.channel}`
                   );
-                  const dupNotice = await safeReply(message, {
+                  const buttons = [];
+                  const authorId = message.author?.id || '0';
+                  if (!options.overrideChannel) {
+                    buttons.push(
+                      new ButtonBuilder()
+                        .setCustomId(`delete_duplicate:${message.id}:${authorId}`)
+                        .setLabel('Delete Post')
+                        .setStyle(ButtonStyle.Danger)
+                        .setEmoji('🗑️'),
+                      new ButtonBuilder()
+                        .setCustomId(`dismiss_alert:${authorId}`)
+                        .setLabel('Dismiss')
+                        .setStyle(ButtonStyle.Secondary)
+                        .setEmoji('✖️')
+                    );
+                  }
+                  const replyOpts = {
                     content: `ℹ️ This media was already posted by **@${match.postedBy}** in **#${match.channel}**!`,
                     allowedMentions: { repliedUser: false },
-                  }, options.overrideChannel);
+                  };
+                  if (buttons.length > 0) {
+                    replyOpts.components = [new ActionRowBuilder().addComponents(buttons)];
+                  }
+                  const dupNotice = await safeReply(message, replyOpts, options.overrideChannel);
                   scheduleAutoDelete(dupNotice);
                 }
                 continue; // Skip saving duplicate file and skip uploading attachment
@@ -268,11 +324,17 @@ async function processMessage(message, links, options = {}, onStatus) {
               if (finalPath) {
                 const finalExt = path.extname(finalPath);
                 const attachmentName = `${cleanTitle}${finalExt}`;
-                attachments.push({
-                  attachment: new AttachmentBuilder(finalPath, { name: attachmentName }),
+                const mediaAttachment = new AttachmentBuilder(finalPath, { name: attachmentName });
+                if (shouldSpoiler) {
+                  mediaAttachment.setSpoiler(true);
+                }
+                linkAttachments.push({
+                  attachment: mediaAttachment,
                   title: cleanTitle,
                   isVideo: isVideo(finalPath),
                   isAudio: isAudio(finalPath),
+                  isSubtitle: false,
+                  isSpoiler: shouldSpoiler,
                 });
 
                 // Attach Subtitles (if uploading to Discord is enabled)
@@ -285,11 +347,17 @@ async function processMessage(message, links, options = {}, onStatus) {
                   // 1. Always prioritize and attach English subtitles individually
                   for (const enSub of englishSubs) {
                     const cleanName = getCleanSubtitleFilename(enSub, cleanTitle);
-                    attachments.push({
-                      attachment: new AttachmentBuilder(enSub, { name: cleanName }),
+                    const subAttachment = new AttachmentBuilder(enSub, { name: cleanName });
+                    if (shouldSpoiler) {
+                      subAttachment.setSpoiler(true);
+                    }
+                    linkAttachments.push({
+                      attachment: subAttachment,
                       title: `${cleanTitle} (English CC)`,
                       isVideo: false,
                       isAudio: false,
+                      isSubtitle: true,
+                      isSpoiler: shouldSpoiler,
                     });
                   }
 
@@ -308,21 +376,33 @@ async function processMessage(message, links, options = {}, onStatus) {
                         
                         const zipRes = spawnSync('tar', zipArgs, { cwd: tempDir, windowsHide: true });
                         if (zipRes.status === 0 && fs.existsSync(zipPath)) {
-                          attachments.push({
-                            attachment: new AttachmentBuilder(zipPath, { name: path.basename(zipPath) }),
+                          const zipAttachment = new AttachmentBuilder(zipPath, { name: path.basename(zipPath) });
+                          if (shouldSpoiler) {
+                            zipAttachment.setSpoiler(true);
+                          }
+                          linkAttachments.push({
+                            attachment: zipAttachment,
                             title: `${cleanTitle} (All Subtitles)`,
                             isVideo: false,
                             isAudio: false,
+                            isSubtitle: true,
+                            isSpoiler: shouldSpoiler,
                           });
                         } else {
                           console.error('[Subtitles] Failed to zip subtitles:', zipRes.stderr?.toString());
                           // Fallback to individual
                           for (const sub of nonEnglishSubs) {
-                            attachments.push({
-                              attachment: new AttachmentBuilder(sub, { name: getCleanSubtitleFilename(sub, cleanTitle) }),
+                            const subAttachment = new AttachmentBuilder(sub, { name: getCleanSubtitleFilename(sub, cleanTitle) });
+                            if (shouldSpoiler) {
+                              subAttachment.setSpoiler(true);
+                            }
+                            linkAttachments.push({
+                              attachment: subAttachment,
                               title: `${cleanTitle} (CC)`,
                               isVideo: false,
                               isAudio: false,
+                              isSubtitle: true,
+                              isSpoiler: shouldSpoiler,
                             });
                           }
                         }
@@ -332,11 +412,17 @@ async function processMessage(message, links, options = {}, onStatus) {
                     } else {
                       // Attach remaining non-English subtitles individually
                       for (const sub of nonEnglishSubs) {
-                        attachments.push({
-                          attachment: new AttachmentBuilder(sub, { name: getCleanSubtitleFilename(sub, cleanTitle) }),
+                        const subAttachment = new AttachmentBuilder(sub, { name: getCleanSubtitleFilename(sub, cleanTitle) });
+                        if (shouldSpoiler) {
+                          subAttachment.setSpoiler(true);
+                        }
+                        linkAttachments.push({
+                          attachment: subAttachment,
                           title: `${cleanTitle} (CC)`,
                           isVideo: false,
                           isAudio: false,
+                          isSubtitle: true,
+                          isSpoiler: shouldSpoiler,
                         });
                       }
                     }
@@ -354,6 +440,55 @@ async function processMessage(message, links, options = {}, onStatus) {
           for (const record of postRecordsToSave) {
             await saveRecord(record);
           }
+
+          // Upload media attachments for this specific link
+          if (linkAttachments.length > 0) {
+            const totalBatches = Math.ceil(linkAttachments.length / 10);
+            for (let i = 0; i < linkAttachments.length; i += 10) {
+              const chunk = linkAttachments.slice(i, i + 10);
+              const batchNum = Math.floor(i / 10) + 1;
+              const files = chunk.map((c) => c.attachment);
+              const replyOptions = { files };
+
+              if (config.includeTitleInMessage) {
+                const mediaItems = chunk.filter((item) => !item.isSubtitle && isValidDisplayTitle(item.title));
+                const uniqueTitles = [...new Set(mediaItems.map((item) => item.title.replace(/[\r\n]+/g, ' ').trim()))];
+                const isChunkSpoilered = chunk.some((c) => c.isSpoiler);
+
+                const formatTitle = (t) => {
+                  return isChunkSpoilered && config.spoilerTitles ? `||**${t}**||` : `**${t}**`;
+                };
+
+                if (totalBatches > 1) {
+                  const rawAlbumTitle = uniqueTitles.length === 1 ? uniqueTitles[0] : '';
+                  const albumTitle = rawAlbumTitle ? ` — ${formatTitle(rawAlbumTitle)}` : '';
+                  replyOptions.content = `🖼️ Album Part ${batchNum}/${totalBatches} (${chunk.length} items)${albumTitle}:`;
+                } else if (uniqueTitles.length === 1) {
+                  const singleItem = mediaItems[0] || chunk[0];
+                  const icon = singleItem.isVideo ? '🎬' : singleItem.isAudio ? '🎵' : '🖼️';
+                  replyOptions.content = `${icon} ${formatTitle(uniqueTitles[0])}`;
+                } else if (uniqueTitles.length > 1) {
+                  const titleLines = mediaItems.slice(0, 5).map((item) => {
+                    const icon = item.isVideo ? '🎬' : item.isAudio ? '🎵' : '🖼️';
+                    const t = item.title.replace(/[\r\n]+/g, ' ').trim();
+                    return `${icon} ${formatTitle(t)}`;
+                  });
+                  replyOptions.content = [...new Set(titleLines)].join('\n');
+                }
+              } else if (totalBatches > 1) {
+                replyOptions.content = `🖼️ Album Part ${batchNum}/${totalBatches} (${chunk.length} items):`;
+              }
+
+              await safeReply(message, replyOptions, options.overrideChannel);
+              totalUploaded += chunk.length;
+            }
+
+            // Automatically suppress the original link's preview embed once media is uploaded
+            if (config.autoSuppressEmbeds && !hasSuppressedEmbeds) {
+              await message.suppressEmbeds(true).catch(() => {});
+              hasSuppressedEmbeds = true;
+            }
+          }
         })();
 
         inFlightDownloads.set(lockKey, workPromise);
@@ -367,47 +502,6 @@ async function processMessage(message, links, options = {}, onStatus) {
       } catch (err) {
         console.error(`Failed to download ${link.url}:`, err);
         failures.push({ url: link.url, reason: describeError(err) });
-      }
-    }
-
-    if (attachments.length > 0) {
-      // Method B: Direct multi-batch replies chunked at Discord's 10-attachment limit
-      const totalBatches = Math.ceil(attachments.length / 10);
-      for (let i = 0; i < attachments.length; i += 10) {
-        const chunk = attachments.slice(i, i + 10);
-        const batchNum = Math.floor(i / 10) + 1;
-        const files = chunk.map((c) => c.attachment);
-        const replyOptions = { files };
-
-        if (config.includeTitleInMessage) {
-          const validItems = chunk.filter((item) => isValidDisplayTitle(item.title));
-          const uniqueTitles = [...new Set(validItems.map((item) => item.title.replace(/[\r\n]+/g, ' ').trim()))];
-
-          if (totalBatches > 1) {
-            const albumTitle = uniqueTitles.length === 1 ? ` — **${uniqueTitles[0]}**` : '';
-            replyOptions.content = `🖼️ Album Part ${batchNum}/${totalBatches} (${chunk.length} items)${albumTitle}:`;
-          } else if (uniqueTitles.length === 1) {
-            const singleItem = validItems[0] || chunk[0];
-            const icon = singleItem.isVideo ? '🎬' : singleItem.isAudio ? '🎵' : '🖼️';
-            replyOptions.content = `${icon} **${uniqueTitles[0]}**`;
-          } else if (uniqueTitles.length > 1) {
-            const titleLines = validItems.slice(0, 5).map((item) => {
-              const icon = item.isVideo ? '🎬' : item.isAudio ? '🎵' : '🖼️';
-              const t = item.title.replace(/[\r\n]+/g, ' ').trim();
-              return `${icon} **${t}**`;
-            });
-            replyOptions.content = [...new Set(titleLines)].join('\n');
-          }
-        } else if (totalBatches > 1) {
-          replyOptions.content = `🖼️ Album Part ${batchNum}/${totalBatches} (${chunk.length} items):`;
-        }
-
-        await safeReply(message, replyOptions, options.overrideChannel);
-      }
-
-      // Automatically suppress the original link's preview embed to keep chat clean
-      if (config.autoSuppressEmbeds) {
-        await message.suppressEmbeds(true).catch(() => {});
       }
     }
 
@@ -428,7 +522,7 @@ async function processMessage(message, links, options = {}, onStatus) {
       scheduleAutoDelete(notice);
     }
 
-    return { found: links.length, uploaded: attachments.length, failed: failures.length };
+    return { found: links.length, uploaded: totalUploaded, failed: failures.length };
   } finally {
     await cleanup(tempDir);
   }

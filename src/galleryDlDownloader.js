@@ -5,6 +5,7 @@ import { config } from './config.js';
 import { getGalleryDlConfigPath } from './galleryDlConfig.js';
 import { getCookieForUrl } from './cookieVault.js';
 import { killProcessTree, getBrowserUserAgent } from './utils.js';
+import { checkNsfwInMetadata } from './urlExtractor.js';
 
 const TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes (allows buffer for platform rate-limit waits)
 
@@ -12,7 +13,7 @@ const TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes (allows buffer for platform rate-
  * Uses gallery-dl to download image(s) from a platform link (Twitter/X,
  * Instagram, Reddit, Tumblr, Pixiv, etc). gallery-dl is built for image
  * galleries, unlike yt-dlp which targets video. Returns an array of
- * downloaded file paths.
+ * downloaded file paths with isNsfw property.
  */
 export async function downloadWithGalleryDl(url, destDir) {
   await fs.promises.mkdir(destDir, { recursive: true });
@@ -26,6 +27,7 @@ export async function downloadWithGalleryDl(url, destDir) {
     '--no-check-certificate',
     '--filesize-max', `${hardCapMB}M`,
     '--user-agent', getBrowserUserAgent(activeBrowser),
+    '--write-metadata',
   ];
 
   const cookiePath = getCookieForUrl(url);
@@ -50,12 +52,27 @@ export async function downloadWithGalleryDl(url, destDir) {
     await runProcess(config.gallerydlPath, args);
   }
 
-  const files = await walkFiles(destDir);
-  if (files.length === 0) {
+  const allFiles = await walkFiles(destDir);
+  const jsonFiles = allFiles.filter((f) => f.endsWith('.json'));
+  const mediaFiles = allFiles.filter((f) => !f.endsWith('.json') && !f.endsWith('.txt'));
+
+  if (mediaFiles.length === 0) {
     throw new Error('GALLERYDL_NO_MEDIA_FOUND');
   }
 
-  return files;
+  let isNsfw = false;
+  for (const jsonPath of jsonFiles) {
+    try {
+      const raw = await fs.promises.readFile(jsonPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (checkNsfwInMetadata(parsed)) {
+        isNsfw = true;
+        break;
+      }
+    } catch {}
+  }
+
+  return Object.assign(mediaFiles, { mediaFiles, isNsfw });
 }
 
 // gallery-dl nests downloads in site/user subdirectories by default, so we

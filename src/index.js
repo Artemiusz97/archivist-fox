@@ -1,13 +1,14 @@
 import { Client, Events, GatewayIntentBits, Partials, PermissionFlagsBits } from 'discord.js';
-import { config, isChannelAllowed } from './config.js';
+import { config, isChannelAllowed, requireDiscordToken } from './config.js';
 import { handleMessage } from './mediaHandler.js';
 import { processMessageLinks } from './linkDetector.js';
 import { initLinkDb, pruneExpiredLinks, closeLinkDb, checkpointWal } from './linkDb.js';
-import { scheduleAutoDelete, cleanupStaleTempDirs } from './utils.js';
+import { scheduleAutoDelete, scheduleCommandMessageDelete, cleanupStaleTempDirs } from './utils.js';
 import { ensureBinaries } from './ensureBinaries.js';
 import { initAutoUpdater } from './autoUpdater.js';
 import { handleRescanCommand, stopActiveTasks, runStartupScan } from './scanner.js';
 import { registerCommands, handleInteraction, getHelpEmbed } from './commands.js';
+import { startWebServer } from './web/server.js';
 
 const client = new Client({
   intents: [
@@ -69,10 +70,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
   await handleInteraction(interaction);
 });
 
-function isRetryCommand(content) {
-  const firstWord = content.trim().toLowerCase().split(/\s+/)[0];
+function parseRetryCommand(content) {
+  const parts = content.trim().toLowerCase().split(/\s+/);
+  const firstWord = parts[0];
   const retryCmd = (config.retryCommand || '!repost').toLowerCase();
-  return firstWord === retryCmd;
+  const reupCmd = (config.reupCommand || '!reup').toLowerCase();
+
+  const isReup = firstWord === reupCmd || firstWord === '!reup' || firstWord === '!reupload' || firstWord === '!force';
+  const isRetry = firstWord === retryCmd || firstWord === '!retry' || firstWord === '!repost';
+
+  if (!isReup && !isRetry) return null;
+
+  const isForce = isReup || parts.includes('--force') || parts.includes('-f') || parts.includes('force');
+  return { isForce, cmd: firstWord };
 }
 
 function isRescanCommand(content) {
@@ -93,18 +103,18 @@ function isStopCommand(content) {
 }
 
 /**
- * Handles `!repost` (or whatever RETRY_COMMAND is set to): reply to the
- * message containing a link with this command, and the bot re-runs the
- * download/upload pipeline on the message you replied to. Useful for
- * catching up on links posted while the bot was offline.
+ * Handles `!repost` (or whatever RETRY_COMMAND is set to) and `!reup`:
+ * reply to the message containing a link with this command, and the bot re-runs the
+ * download/upload pipeline on the message you replied to.
  */
-async function handleRetryCommand(commandMessage) {
+async function handleRetryCommand(commandMessage, isForce = false, cmd = '!retry') {
   if (!commandMessage.reference) {
     const notice = await commandMessage.reply({
-      content: `Reply to a message containing a link, then send \`${config.retryCommand}\` to retry it.`,
+      content: `Reply to a message containing a link, then send \`${cmd}\` to retry it.`,
       allowedMentions: { repliedUser: false },
     });
     scheduleAutoDelete(notice);
+    scheduleCommandMessageDelete(commandMessage);
     return;
   }
 
@@ -112,7 +122,7 @@ async function handleRetryCommand(commandMessage) {
   try {
     hourglassReaction = await commandMessage.react('⏳').catch(() => null);
     const target = await commandMessage.fetchReference();
-    await handleMessage(target, { notifyIfEmpty: true });
+    await handleMessage(target, { notifyIfEmpty: true, force: isForce });
     await commandMessage.react('✅').catch(() => {});
   } catch (err) {
     console.error(`Retry command failed for message ${commandMessage.id}:`, err);
@@ -121,6 +131,8 @@ async function handleRetryCommand(commandMessage) {
     if (hourglassReaction) {
       await hourglassReaction.users.remove(client.user.id).catch(() => {});
     }
+    // Automatically remove the command message after a few seconds so the user sees the confirmation reaction first
+    scheduleCommandMessageDelete(commandMessage);
   }
 }
 
@@ -130,6 +142,7 @@ client.on('messageCreate', async (message) => {
 
   try {
     if (message.content.trim().toLowerCase() === '!help') {
+      scheduleCommandMessageDelete(message);
       await message.reply({
         embeds: [getHelpEmbed()],
         allowedMentions: { repliedUser: false },
@@ -138,6 +151,7 @@ client.on('messageCreate', async (message) => {
     }
 
     if (isStopCommand(message.content)) {
+      scheduleCommandMessageDelete(message);
       const isMod =
         message.member?.permissions?.has(PermissionFlagsBits.ManageMessages) ||
         message.member?.permissions?.has(PermissionFlagsBits.Administrator) ||
@@ -158,7 +172,8 @@ client.on('messageCreate', async (message) => {
         if (stopped.scanRunning) msg += '• Aborted active channel rescan / media crawl.\n';
         if (stopped.playlistRunning) msg += '• Aborted active playlist download.\n';
         if (stopped.queueItemsCleared > 0) msg += `• Cleared **${stopped.queueItemsCleared}** queued download(s).\n`;
-        await message.reply({ content: msg, allowedMentions: { repliedUser: false } });
+        const notice = await message.reply({ content: msg, allowedMentions: { repliedUser: false } });
+        scheduleAutoDelete(notice);
       } else {
         const notice = await message.reply({
           content: 'ℹ️ No active rescan, playlist download, or queued tasks are currently running.',
@@ -169,12 +184,14 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    if (isRetryCommand(message.content)) {
-      await handleRetryCommand(message);
+    const retryInfo = parseRetryCommand(message.content);
+    if (retryInfo) {
+      await handleRetryCommand(message, retryInfo.isForce, retryInfo.cmd);
       return;
     }
 
     if (isRescanCommand(message.content)) {
+      scheduleCommandMessageDelete(message);
       await handleRescanCommand(message);
       return;
     }
@@ -245,6 +262,8 @@ async function loginWithRetry(discordClient, token, maxRetries = 5) {
   }
 }
 
+let webServerInstance = null;
+
 async function start() {
   await cleanupStaleTempDirs();
   initLinkDb();
@@ -255,6 +274,17 @@ async function start() {
     }
   }
   await ensureBinaries();
+
+  // Start background Web UI server if enabled
+  if (config.enableWebUi) {
+    startWebServer().then((server) => {
+      webServerInstance = server;
+    }).catch((err) => {
+      console.warn('[Web UI] Could not start Web UI background server:', err.message);
+    });
+  }
+
+  requireDiscordToken();
   await loginWithRetry(client, config.token);
   initAutoUpdater();
 }
@@ -265,6 +295,9 @@ async function handleShutdown(signal) {
   isShuttingDown = true;
   console.log(`\n[Shutdown] Received ${signal}. Gracefully checkpointing database and closing...`);
   try {
+    if (webServerInstance) {
+      webServerInstance.close();
+    }
     closeLinkDb();
     await client.destroy().catch(() => {});
   } catch {}

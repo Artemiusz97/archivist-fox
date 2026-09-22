@@ -66,10 +66,16 @@ export const config = {
   redditClientId: process.env.REDDIT_CLIENT_ID || '',
   redditUserAgent: process.env.REDDIT_USER_AGENT || '',
   redditRefreshToken: process.env.REDDIT_REFRESH_TOKEN || '',
+  pixivRefreshToken: process.env.PIXIV_REFRESH_TOKEN || '',
   // How long (ms) to leave error/status messages up before auto-deleting them. 0 = never delete.
   errorMessageTtlMs: Number(process.env.ERROR_MESSAGE_TTL_SECONDS || 0) * 1000,
+  // Auto-delete prefix command messages (!retry, !rescan, !stop, etc.) after a delay
+  autoDeleteCommandMessages: parseBool(process.env.AUTO_DELETE_COMMAND_MESSAGES, true),
+  commandMessageTtlMs: Math.max(0, Number(process.env.COMMAND_MESSAGE_TTL_SECONDS || 4)) * 1000,
   // Text command to retry a link: reply to the message containing the link and send this.
   retryCommand: process.env.RETRY_COMMAND || '!repost',
+  // Text command to force re-uploading a link (bypasses duplicate detection).
+  reupCommand: process.env.REUP_COMMAND || '!reup',
   // Text command to re-scan/crawl channels for media archiving.
   rescanCommand: process.env.RESCAN_COMMAND || '!rescan',
   // Optional: cookies file for Instagram, YouTube, etc. login-restricted content.
@@ -113,6 +119,11 @@ export const config = {
   autoSuppressEmbeds: parseBool(process.env.AUTO_SUPPRESS_EMBEDS, true),
   includeTitleInMessage: parseBool(process.env.INCLUDE_TITLE_IN_MESSAGE, true),
   archiveSubfolderFormat: (process.env.ARCHIVE_SUBFOLDER_FORMAT || 'channel/date').toLowerCase().trim(),
+  // Auto-Spoiler NSFW & User-Flagged Media
+  autoSpoilerNsfw: parseBool(process.env.AUTO_SPOILER_NSFW, true),
+  spoilerNonNsfwChannelsOnly: parseBool(process.env.SPOILER_NON_NSFW_CHANNELS_ONLY, true),
+  spoilerUserFlaggedLinks: parseBool(process.env.SPOILER_USER_FLAGGED_LINKS, true),
+  spoilerTitles: parseBool(process.env.SPOILER_TITLES, true),
   // General Duplicate Link Detector configuration (SQLite)
   enableGeneralDuplicateDetector: parseBool(process.env.ENABLE_GENERAL_DUPLICATE_DETECTOR, true),
   duplicateLinkScope: (process.env.DUPLICATE_LINK_SCOPE || 'channel').toLowerCase().trim(),
@@ -145,7 +156,19 @@ export const config = {
   subtitleFormat: process.env.SUBTITLE_FORMAT || 'srt',
   zipMultiSubtitles: parseBool(process.env.ZIP_MULTI_SUBTITLES, true),
   maxIndividualSubtitles: Math.max(1, Number(process.env.MAX_INDIVIDUAL_SUBTITLES || 3)),
+
+  // Web UI Configuration
+  enableWebUi: parseBool(process.env.ENABLE_WEB_UI, true),
+  webPort: Math.max(1, Number(process.env.WEB_PORT || 3000)),
+  webHost: process.env.WEB_HOST || '0.0.0.0',
 };
+
+export function requireDiscordToken() {
+  if (!config.token) {
+    console.error('Missing DISCORD_TOKEN in your .env file. Copy .env.example to .env and fill it in.');
+    process.exit(1);
+  }
+}
 
 export function isChannelAllowed(channelId) {
   // Allow-list takes priority: if set, ONLY those channels are active.
@@ -157,11 +180,6 @@ export function isChannelAllowed(channelId) {
     return !config.disallowedChannelIds.includes(channelId);
   }
   return true;
-}
-
-if (!config.token) {
-  console.error('Missing DISCORD_TOKEN in your .env file. Copy .env.example to .env and fill it in.');
-  process.exit(1);
 }
 
 if (config.allowedChannelIds.length > 0 && config.disallowedChannelIds.length > 0) {

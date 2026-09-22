@@ -201,7 +201,8 @@ export function getHelpEmbed() {
       {
         name: '💬 Chat Prefix Commands',
         value: [
-          `• **Reply with \`${config.retryCommand}\`** — Retry downloading or reposting media from a message posted while the bot was offline.`,
+          `• **Reply with \`${config.retryCommand}\`** — Retry downloading media if a post was missed.`,
+          `• **Reply with \`${config.reupCommand}\`** — Force re-upload media, bypassing duplicate checks.`,
           `• **\`${config.rescanCommand}\` / \`!crawl\`** — Crawl message history in the current channel.`,
           `• **\`${config.rescanCommand} #channel\`** — Crawl a specific channel.`,
           `• **\`${config.rescanCommand} all\`** — Server-wide historical crawl across all readable channels.`,
@@ -215,7 +216,7 @@ export function getHelpEmbed() {
         value: [
           '• **Fast Video Streaming:** Uses `+faststart` so videos play immediately while buffering.',
           '• **Duplicate Protection:** Prevents duplicate visual media and duplicate link spam.',
-          '• **Interactive Dismiss:** Duplicate alerts include a `🗑️ Dismiss` button for instant cleanup.',
+          '• **Interactive Cleanup:** Duplicate alerts include `🗑️ Delete Post` and `✖️ Dismiss` buttons for instant cleanup.',
           '• **Shortlink Resolution:** Automatically resolves `t.co`, `bit.ly`, `pin.it`, `fav.me`, and TikTok shortlinks.',
           '• **Supported Video/Image:** YouTube, Twitter/X, TikTok, Instagram, Reddit, Threads, Facebook, Bilibili, Bluesky, Streamable, RedGifs, Pixiv, Pinterest, Imgur, **DeviantArt**.',
           '• **Supported Audio/Music:** SoundCloud, Bandcamp, Mixcloud, Audiomack, YouTube Music, Podcasts, and direct MP3/audio URLs.',
@@ -233,14 +234,15 @@ export function getHelpEmbed() {
  */
 export async function handleInteraction(interaction) {
   try {
-    // 1. Button Interactions (e.g. Dismiss button on duplicate alert)
+    // 1. Button Interactions (e.g. Dismiss button or Delete Post on duplicate alert)
     if (interaction.isButton()) {
       if (interaction.customId.startsWith('dismiss_alert:')) {
         const authorId = interaction.customId.split(':')[1];
         const isAuthor = interaction.user.id === authorId;
         const isMod =
           interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages) ||
-          interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
+          interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
+          interaction.guild?.ownerId === interaction.user.id;
 
         if (isAuthor || isMod) {
           await interaction.deferUpdate().catch(() => {});
@@ -251,7 +253,55 @@ export async function handleInteraction(interaction) {
             ephemeral: true,
           });
         }
+        return;
       }
+
+      if (interaction.customId.startsWith('delete_duplicate:')) {
+        const [, targetMessageId, authorId] = interaction.customId.split(':');
+        const isAuthor = interaction.user.id === authorId;
+        const isMod =
+          interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages) ||
+          interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
+          interaction.guild?.ownerId === interaction.user.id;
+
+        if (!isAuthor && !isMod) {
+          await interaction.reply({
+            content: '❌ Only the person who posted the link or a moderator can delete this post.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        // Check if the bot has permission to manage messages in this guild/channel
+        if (interaction.guild) {
+          const botMember = interaction.guild.members.me;
+          const botPermissions = interaction.channel?.permissionsFor(botMember || interaction.client.user);
+          if (botPermissions && !botPermissions.has(PermissionFlagsBits.ManageMessages)) {
+            await interaction.reply({
+              content: '❌ I do not have permission to delete posts in this channel. Please grant Archivist Fox the **Manage Messages** permission.',
+              ephemeral: true,
+            });
+            return;
+          }
+        }
+
+        await interaction.deferUpdate().catch(() => {});
+
+        // Fetch and delete the duplicate message
+        try {
+          const targetMessage = await interaction.channel.messages.fetch(targetMessageId).catch(() => null);
+          if (targetMessage) {
+            await targetMessage.delete().catch(() => {});
+          }
+        } catch (err) {
+          console.error('[Commands] Failed to delete duplicate message:', err);
+        }
+
+        // Delete the bot's alert message as well
+        await interaction.message.delete().catch(() => {});
+        return;
+      }
+
       return;
     }
 
@@ -273,7 +323,7 @@ export async function handleInteraction(interaction) {
         await interaction.deferReply({ ephemeral: true });
 
         try {
-          const result = await handleMessage(targetMessage, { notifyIfEmpty: true });
+          const result = await handleMessage(targetMessage, { notifyIfEmpty: true, force: true });
           if (result.found === 0) {
             await interaction.editReply({ content: 'ℹ️ No supported media links found in that message.' });
           } else {

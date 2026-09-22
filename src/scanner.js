@@ -15,6 +15,7 @@ import { ensureWithinLimit, isValidDisplayTitle } from './mediaHandler.js';
 import { applyThumbnailPreview } from './thumbnailPreview.js';
 import { downloadQueue } from './queue.js';
 import { isPlaylistDownloading } from './playlistHandler.js';
+import { scheduleAutoDelete } from './utils.js';
 
 let isScanningActive = false;
 let isScanStopRequested = false;
@@ -29,9 +30,11 @@ export function isStopRequested() {
 
 export function setScanRunning(val) {
   isScanningActive = Boolean(val);
-  if (!val) {
-    isScanStopRequested = false;
-  }
+  isScanStopRequested = false;
+}
+
+export function clearStopRequested() {
+  isScanStopRequested = false;
 }
 
 export function requestScanStop() {
@@ -424,8 +427,11 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
 
           try {
             let filePaths = [];
+            let subtitleFiles = [];
             try {
-              filePaths = await downloadMedia(link, tempDir);
+              const dlResult = await downloadMedia(link, tempDir);
+              filePaths = Array.isArray(dlResult) ? dlResult : (dlResult?.mediaFiles || []);
+              subtitleFiles = Array.isArray(dlResult) ? [] : (dlResult?.subtitleFiles || []);
             } catch (dlErr) {
               // Fallback: check if media is already preserved in local archive
               const existing = normalized ? await findDuplicateByUrl(link.url) : null;
@@ -466,6 +472,7 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
                 title: cleanTitle,
                 mediaId: fingerprint.mediaId,
                 sha256: fingerprint.sha256,
+                subtitleFiles,
               });
 
               if (archivedPath) {
@@ -751,19 +758,21 @@ function formatDuration(ms) {
  */
 export async function handleRescanCommand(commandMessage) {
   if (isScanningActive) {
-    await commandMessage.reply({
+    const notice = await commandMessage.reply({
       content: '⚠️ A rescan or media crawl is already running. Please wait for it to complete.',
       allowedMentions: { repliedUser: false },
     });
+    scheduleAutoDelete(notice);
     return;
   }
 
   // Permission Check: Requires Manage Messages or Administrator permissions (or server owner)
   if (commandMessage.member && !commandMessage.member.permissions.has(PermissionFlagsBits.ManageMessages) && !commandMessage.member.permissions.has(PermissionFlagsBits.Administrator)) {
-    await commandMessage.reply({
+    const notice = await commandMessage.reply({
       content: '❌ You need the `Manage Messages` or `Administrator` permission to run a channel rescan.',
       allowedMentions: { repliedUser: false },
     });
+    scheduleAutoDelete(notice);
     return;
   }
 
@@ -812,19 +821,21 @@ export async function handleRescanCommand(commandMessage) {
     if (specificChannel && specificChannel.viewable && specificChannel.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.ReadMessageHistory)) {
       targetChannels = [specificChannel];
     } else {
-      await commandMessage.reply({
+      const notice = await commandMessage.reply({
         content: `❌ Could not find or access text channel \`${target}\`.`,
         allowedMentions: { repliedUser: false },
       });
+      scheduleAutoDelete(notice);
       return;
     }
   }
 
   if (targetChannels.length === 0) {
-    await commandMessage.reply({
+    const notice = await commandMessage.reply({
       content: '❌ No accessible text channels found to scan.',
       allowedMentions: { repliedUser: false },
     });
+    scheduleAutoDelete(notice);
     return;
   }
 

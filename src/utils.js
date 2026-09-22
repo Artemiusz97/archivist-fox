@@ -8,12 +8,35 @@ import { config } from './config.js';
  * Schedules a bot-sent message for deletion after ERROR_MESSAGE_TTL_SECONDS,
  * if configured. No-ops if the TTL is 0/unset. Failures (message already
  * gone, missing permissions) are swallowed silently.
+ *
+ * @param {import('discord.js').Message} message
+ * @param {number} [ttlMs] - Optional explicit TTL in ms. Defaults to config.errorMessageTtlMs.
  */
-export function scheduleAutoDelete(message) {
-  if (!message || config.errorMessageTtlMs <= 0) return;
+export function scheduleAutoDelete(message, ttlMs = config.errorMessageTtlMs) {
+  const effectiveTtl = ttlMs !== undefined ? ttlMs : config.errorMessageTtlMs;
+  if (!message || effectiveTtl <= 0) return;
   const timer = setTimeout(() => {
     message.delete().catch(() => {});
-  }, config.errorMessageTtlMs);
+  }, effectiveTtl);
+  timer.unref?.();
+}
+
+/**
+ * Schedules a user-sent command message (e.g. !retry, !rescan, !stop) for deletion
+ * after COMMAND_MESSAGE_TTL_SECONDS, if AUTO_DELETE_COMMAND_MESSAGES is enabled.
+ * Requires the bot to have "Manage Messages" permission in the channel.
+ * Failures (missing permissions, already deleted) are silently caught.
+ *
+ * @param {import('discord.js').Message} message
+ * @param {number} [ttlMs] - Optional explicit TTL in ms. Defaults to config.commandMessageTtlMs.
+ */
+export function scheduleCommandMessageDelete(message, ttlMs = config.commandMessageTtlMs) {
+  if (!message || !config.autoDeleteCommandMessages) return;
+  const delay = ttlMs !== undefined ? ttlMs : config.commandMessageTtlMs;
+  if (delay < 0) return;
+  const timer = setTimeout(() => {
+    message.delete().catch(() => {});
+  }, delay);
   timer.unref?.();
 }
 

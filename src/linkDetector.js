@@ -102,13 +102,29 @@ export async function processMessageLinks(message) {
   // If duplicate URLs were found, send an alert reply
   if (alertLines.length > 0) {
     try {
-      const dismissRow = new ActionRowBuilder().addComponents(
+      const buttons = [];
+
+      // If all links in the message are duplicates (no new/unique links to preserve),
+      // provide a button to delete the duplicate post directly.
+      if (newUrls.length === 0) {
+        buttons.push(
+          new ButtonBuilder()
+            .setCustomId(`delete_duplicate:${messageId}:${authorId}`)
+            .setLabel('Delete Post')
+            .setStyle(ButtonStyle.Danger)
+            .setEmoji('🗑️')
+        );
+      }
+
+      buttons.push(
         new ButtonBuilder()
           .setCustomId(`dismiss_alert:${authorId}`)
           .setLabel('Dismiss')
           .setStyle(ButtonStyle.Secondary)
-          .setEmoji('🗑️')
+          .setEmoji('✖️')
       );
+
+      const alertRow = new ActionRowBuilder().addComponents(buttons);
 
       // Cap alert to 3 entries to stay within Discord's 2,000-character limit
       // when a user pastes a message containing many duplicate URLs at once.
@@ -121,7 +137,7 @@ export async function processMessageLinks(message) {
 
       const notice = await message.reply({
         content: visibleLines.join('\n\n'),
-        components: [dismissRow],
+        components: [alertRow],
         allowedMentions: { repliedUser: false },
       });
 

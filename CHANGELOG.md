@@ -23,6 +23,7 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 
 | Version | Release Date | Type | Primary Milestone / Theme |
 | :--- | :--- | :--- | :--- |
+| **[v3.10.0](#v3100---2026-09-22)** | 2026-09-22 | Minor | Web UI & Downloader Dashboard, NSFW Auto-Spoiler Engine, Per-Link Streaming Uploads, Interactive Duplicate Cleanup (`Delete Post`), Force Re-upload (`!reup`), Auto-Delete Command Messages, Pixiv OAuth Helper. |
 | **[v3.9.0](#v390---2026-09-18)** | 2026-09-18 | Minor | YouTube Playlist & Subtitle Suite: Interactive playlist prompt buttons, auto-threading, creator/auto-generated subtitle extraction & zip bundling. |
 | **[v3.8.0](#v380---2026-09-17)** | 2026-09-17 | Minor | DeviantArt Platform Expansion: Native DeviantArt & Sta.sh scraping, fav.me base-36 canonical unshortening, gallery-dl fast-path routing, DeviantArt cookie vault. |
 | **[v3.7.0](#v370---2026-09-16)** | 2026-09-16 | Minor | Message Deletion Fallback, Context Menu Channel-Gating, Faststart Streaming & Live Telemetry. |
@@ -50,9 +51,51 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 
 ## Release Details
 
+### [v3.10.0] - 2026-09-22
+
+#### Added & Improved
+- **Web Dashboard & Media Downloader (`src/web/`, `src/downloaderCore.js`, `run_web.bat`, `package.json`)**:
+  - Modern, responsive web control center and media player.
+  - Live SSE progress streaming (`checking`, `downloading`, `processing`, `archiving`, `finalizing`).
+  - Integrated archive browser with Windows Explorer integration (`/select,filepath`), database statistics, and live download telemetry.
+  - Unified downloader core engine (`src/downloaderCore.js`) providing reusable downloading, fingerprinting, deduplication, and archiving.
+  - Dual running mode: auto-starts alongside the Discord bot (`ENABLE_WEB_UI=true`, `WEB_PORT=3000`, `WEB_HOST=0.0.0.0`) or standalone via `npm run web` / `run_web.bat`.
+- **Auto-Spoiler System for NSFW & User-Flagged Media (`src/urlExtractor.js`, `src/mediaHandler.js`, `src/ytdlpDownloader.js`, `src/galleryDlDownloader.js`, `src/config.js`, `.env.example`)**:
+  - Domain-level detection for known NSFW platforms (nhentai, e-hentai, rule34, danbooru, gelbooru, yande.re, sankaku, kemono, coomer, pornhub, xvideos, xhamster, redgifs, etc.).
+  - Deep metadata inspection: yt-dlp `--write-info-json` (`age_limit >= 18`, tags, categories) and gallery-dl `--write-metadata` (`is_mature`, `r-18`, `r-18g`, `nsfw`, `18+`, `explicit`).
+  - In-chat spoiler syntax awareness: `getSpoilerRanges(content)` detects if links in user messages are surrounded by `||...||`.
+  - Discord attachment auto-spoilering: automatically sets `.setSpoiler(true)` on `AttachmentBuilder` for images, videos, audio, and subtitle zip files.
+  - Spoilered title formatting: `||**Title**||` when `SPOILER_TITLES=true`.
+  - Smart channel scoping: `SPOILER_NON_NSFW_CHANNELS_ONLY=true` allows media in age-restricted/NSFW channels to display without spoilers unless the user explicitly spoilered the link in their message.
+- **Per-Link Streaming Upload Pipeline (`src/mediaHandler.js`)**:
+  - Refactored upload pipeline to stream attachments per-link as soon as each individual link finishes downloading, eliminating long multi-link delays.
+  - Immediate preview embed suppression (`message.suppressEmbeds(true)`) upon first media upload.
+- **Interactive Duplicate Post Cleanup (`src/linkDetector.js`, `src/commands.js`)**:
+  - When all links in a message are duplicates, duplicate alerts include an interactive **`🗑️ Delete Post`** button alongside **`✖️ Dismiss`**.
+  - Allows authors, moderators, or server owners to delete the duplicate message and alert in one click.
+  - Graceful fallback and permission verification for `Manage Messages`.
+- **Force Re-upload Command (`!reup` / `!retry --force`) (`src/index.js`, `src/commands.js`, `src/config.js`, `src/mediaHandler.js`)**:
+  - Added `!reup` prefix command (`REUP_COMMAND`, with aliases `!reupload`, `!force`, `!retry --force`).
+  - Bypasses duplicate detection to force re-uploading media from a replied-to message.
+  - Zero-bandwidth local archive retrieval: if the pristine file already exists in `ARCHIVE_DIRECTORY`, re-uses the local file immediately without re-downloading.
+  - Context menu command `Repost / Archive Media` updated to force re-upload.
+- **Auto-Delete Command Messages (`src/index.js`, `src/utils.js`, `src/config.js`, `.env.example`)**:
+  - Automatically deletes user command messages (`!retry`, `!reup`, `!rescan`, `!stop`, `!help`) after a configurable delay (`AUTO_DELETE_COMMAND_MESSAGES=true`, `COMMAND_MESSAGE_TTL_SECONDS=4`).
+- **Pixiv OAuth Authorization Helper & Guide (`scripts/pixiv_auth.py`, `pixiv_login.bat`, `PIXIV_LOGIN_GUIDE.txt`, `src/galleryDlConfig.js`, `src/config.js`)**:
+  - Added PKCE authentication script (`scripts/pixiv_auth.py`) and Windows shortcut (`pixiv_login.bat` / `npm run pixiv-login`).
+  - Generates auth URL, exchanges callback code, and writes `PIXIV_REFRESH_TOKEN` to `.env` and gallery-dl config.
+  - Added comprehensive beginner's guide [`PIXIV_LOGIN_GUIDE.txt`](PIXIV_LOGIN_GUIDE.txt).
+- **Channel Crawl Subtitle Archival & Playlist Stability (`src/scanner.js`, `src/playlistHandler.js`)**:
+  - Preserves subtitle tracks during historical channel crawls (`crawlChannel`).
+  - Playlist processing properly resets stop state flags (`clearStopRequested()`) and handles download errors gracefully.
+
 ### [v3.9.0] - 2026-09-18
 
 #### Added & Improved
+- **Force Re-upload Command (`!reup`)**:
+  - Reply to any message with `!reup` (or `!reupload`, `!force`, `!retry --force`) to force the bot to upload media into Discord, completely bypassing duplicate detection limits. 
+  - **Local Archive Fast-Path**: If `!reup` detects that the pristine original media is already cached in your `ARCHIVE_DIRECTORY`, it will instantly use the local file instead of re-downloading it from the web, saving bandwidth and time.
+  - Context menu "Repost / Archive Media" now also enforces duplicate bypassing.
 - **Interactive YouTube Playlists (`src/playlistHandler.js`)**:
   - Interactive Discord action buttons (`🎬 This Video Only`, `📁 Entire Playlist (N)`, `❌ Cancel`) with author/moderator permission gating.
   - Automatic Discord thread creation (`PLAYLIST_AUTO_THREAD=true`) to host playlist video batches and keep main channels clean.

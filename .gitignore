@@ -42,6 +42,9 @@ tempmediaStorage/
 .DS_Store
 Thumbs.db
 *.log
+__pycache__/
+*.pyc
+scratch/
 
 # Distribution & Release Archives
 releases/

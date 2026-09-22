@@ -57,7 +57,104 @@ const PLATFORM_DOMAINS = [
   'deviantart.com',  // DeviantArt image/artwork gallery
   'fav.me',          // DeviantArt shortlink (resolved first via SHORTENER_HOSTS)
   'sta.sh',          // DeviantArt Sta.sh upload links
+  'danbooru.donmai.us',
+  'gelbooru.com',
+  'e621.net',
+  'e926.net',
+  'rule34.xxx',
+  'kemono.su',
+  'kemono.party',
+  'coomer.su',
+  'coomer.party',
 ];
+
+export const KNOWN_NSFW_DOMAINS = new Set([
+  'redgifs.com',
+  'gelbooru.com',
+  'danbooru.donmai.us',
+  'e621.net',
+  'e926.net',
+  'rule34.xxx',
+  'rule34.paheal.net',
+  'nhentai.net',
+  'hentai-foundry.com',
+  'pornhub.com',
+  'xvideos.com',
+  'xnxx.com',
+  'erome.com',
+  'kemono.party',
+  'kemono.su',
+  'coomer.party',
+  'coomer.su',
+]);
+
+export function isKnownNsfwUrl(rawUrl) {
+  if (!rawUrl) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase().replace(/^(www\.|m\.)/, '');
+    if (KNOWN_NSFW_DOMAINS.has(host)) return true;
+    for (const d of KNOWN_NSFW_DOMAINS) {
+      if (host.endsWith(`.${d}`)) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Evaluates whether platform metadata from gallery-dl or yt-dlp indicates NSFW / sensitive content.
+ *
+ * @param {object} meta - Parsed metadata object
+ * @returns {boolean}
+ */
+export function checkNsfwInMetadata(meta) {
+  if (!meta || typeof meta !== 'object') return false;
+
+  // Twitter / X: possibly_sensitive: true, sensitive: true
+  if (meta.possibly_sensitive === true || meta.sensitive === true) return true;
+
+  // Reddit: over_18: true, spoiler: true
+  if (meta.over_18 === true || meta.spoiler === true) return true;
+
+  // Pixiv: x_restrict > 0 (1 = R-18, 2 = R-18G), age_limit >= 18
+  if (typeof meta.x_restrict === 'number' && meta.x_restrict > 0) return true;
+  if (typeof meta.age_limit === 'number' && meta.age_limit >= 18) return true;
+
+  // Boorus (Danbooru, Gelbooru, etc.): rating = 'e', 'q', 'explicit', 'questionable'
+  if (typeof meta.rating === 'string') {
+    const r = meta.rating.toLowerCase();
+    if (['e', 'q', 'explicit', 'questionable'].includes(r)) return true;
+  }
+
+  // Bluesky: labels array containing "sexual", "nudity", "porn", "nsfw"
+  if (Array.isArray(meta.labels)) {
+    const nsfwLabels = new Set(['sexual', 'nudity', 'porn', 'nsfw']);
+    for (const label of meta.labels) {
+      const val = (typeof label === 'string' ? label : label?.val || label?.value || '').toLowerCase();
+      if (nsfwLabels.has(val)) return true;
+    }
+  }
+
+  // DeviantArt: is_mature: true
+  if (meta.is_mature === true) return true;
+
+  // Tags check: "R-18", "R-18G", "NSFW", "18+", "explicit"
+  const tags = Array.isArray(meta.tags)
+    ? meta.tags
+    : typeof meta.tags === 'string'
+      ? meta.tags.split(/[\s,]+/)
+      : [];
+
+  const nsfwTags = new Set(['r-18', 'r-18g', 'r18', 'r18g', 'nsfw', '18+', 'explicit']);
+  for (const tag of tags) {
+    const t = String(tag).toLowerCase().trim();
+    if (nsfwTags.has(t)) return true;
+  }
+
+  return false;
+}
 
 const TRACKING_PARAMS = new Set([
   'utm_source',
@@ -528,12 +625,30 @@ export async function resolveShortUrl(rawUrl) {
   return rawUrl;
 }
 
+export function getSpoilerRanges(content) {
+  const ranges = [];
+  if (!content) return ranges;
+  const regex = /\|\|([\s\S]*?)\|\|/g;
+  let match;
+  while ((match = regex.exec(content)) !== null) {
+    ranges.push({
+      start: match.index,
+      end: regex.lastIndex,
+    });
+  }
+  return ranges;
+}
+
 export function extractMediaLinks(content) {
-  const rawMatches = content.match(URL_REGEX) || [];
+  if (!content) return [];
+  const spoilerRanges = getSpoilerRanges(content);
+  const regex = new RegExp(URL_REGEX.source, 'gi');
+  const rawMatches = [...content.matchAll(regex)];
   const results = [];
   const seen = new Set();
 
-  for (const raw of rawMatches) {
+  for (const match of rawMatches) {
+    const raw = match[0];
     const cleaned = stripQueryAndTrailingPunctuation(raw);
     if (seen.has(cleaned)) continue;
     seen.add(cleaned);
@@ -547,11 +662,13 @@ export function extractMediaLinks(content) {
 
     const hostname = parsed.hostname.replace(/^www\./, '').toLowerCase();
     const ext = getExtension(parsed.pathname);
+    const isSpoiler = spoilerRanges.some((r) => match.index >= r.start && match.index < r.end);
+    const isNsfw = isKnownNsfwUrl(cleaned);
 
     if (ext && DIRECT_MEDIA_EXTENSIONS.has(ext)) {
-      results.push({ url: cleaned, type: 'direct' });
+      results.push({ url: cleaned, type: 'direct', isSpoiler, isKnownNsfw: isNsfw });
     } else if (PLATFORM_DOMAINS.some((d) => hostname === d || hostname.endsWith(`.${d}`))) {
-      results.push({ url: cleaned, type: 'platform' });
+      results.push({ url: cleaned, type: 'platform', isSpoiler, isKnownNsfw: isNsfw });
     }
     // else: not a recognized media link, ignore
   }
@@ -596,18 +713,22 @@ export async function extractAllUrlsAsync(content) {
  */
 export async function extractMediaLinksAsync(content) {
   if (!content) return [];
-  const rawMatches = content.match(URL_REGEX) || [];
+  const spoilerRanges = getSpoilerRanges(content);
+  const regex = new RegExp(URL_REGEX.source, 'gi');
+  const rawMatches = [...content.matchAll(regex)];
   const results = [];
   const seen = new Set();
 
   const resolvedUrls = await Promise.all(
-    rawMatches.map(async (raw) => {
-      const cleaned = stripQueryAndTrailingPunctuation(raw);
-      return resolveShortUrl(cleaned);
+    rawMatches.map(async (match) => {
+      const cleaned = stripQueryAndTrailingPunctuation(match[0]);
+      const resolved = await resolveShortUrl(cleaned);
+      const isSpoiler = spoilerRanges.some((r) => match.index >= r.start && match.index < r.end);
+      return { resolved, isSpoiler };
     })
   );
 
-  for (const cleaned of resolvedUrls) {
+  for (const { resolved: cleaned, isSpoiler } of resolvedUrls) {
     if (seen.has(cleaned)) continue;
     seen.add(cleaned);
 
@@ -620,11 +741,12 @@ export async function extractMediaLinksAsync(content) {
 
     const hostname = parsed.hostname.replace(/^www\./, '').toLowerCase();
     const ext = getExtension(parsed.pathname);
+    const isNsfw = isKnownNsfwUrl(cleaned);
 
     if (ext && DIRECT_MEDIA_EXTENSIONS.has(ext)) {
-      results.push({ url: cleaned, type: 'direct' });
+      results.push({ url: cleaned, type: 'direct', isSpoiler, isKnownNsfw: isNsfw });
     } else if (PLATFORM_DOMAINS.some((d) => hostname === d || hostname.endsWith(`.${d}`))) {
-      results.push({ url: cleaned, type: 'platform' });
+      results.push({ url: cleaned, type: 'platform', isSpoiler, isKnownNsfw: isNsfw });
     }
   }
 
