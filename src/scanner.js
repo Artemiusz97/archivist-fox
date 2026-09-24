@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { ChannelType, PermissionFlagsBits, AttachmentBuilder } from 'discord.js';
-import { config, isChannelAllowed } from './config.js';
+import { config, isChannelAllowed, isLinkBackupChannel } from './config.js';
 import { extractMediaLinksAsync, extractAllUrlsAsync, normalizeUrl, extractPlatformMediaId, isDeviantArtUrl } from './urlExtractor.js';
 import { downloadDirect } from './directDownloader.js';
 import { downloadWithYtDlp } from './ytdlpDownloader.js';
@@ -15,6 +15,7 @@ import { ensureWithinLimit, isValidDisplayTitle } from './mediaHandler.js';
 import { applyThumbnailPreview } from './thumbnailPreview.js';
 import { downloadQueue } from './queue.js';
 import { isPlaylistDownloading } from './playlistHandler.js';
+import { isRestoreRunning, requestRestoreStop } from './linkRestorer.js';
 import { scheduleAutoDelete } from './utils.js';
 
 let isScanningActive = false;
@@ -48,9 +49,11 @@ export function requestScanStop() {
 export function stopActiveTasks() {
   const scanRunning = isScanningActive;
   const playlistRunning = isPlaylistDownloading();
+  const restoreRunning = isRestoreRunning();
   isScanStopRequested = true;
+  requestRestoreStop();
   const queueItemsCleared = downloadQueue.clear();
-  return { scanRunning, playlistRunning, queueItemsCleared };
+  return { scanRunning, playlistRunning, restoreRunning, queueItemsCleared };
 }
 
 /**
@@ -324,17 +327,20 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
             channelId: channel.id,
           });
           if (!isDuplicate) {
-            saveLinkRecord({
-              normalizedUrl,
-              originalUrl,
-              guildId: channel.guildId || null,
-              channelId: channel.id,
-              channelName: channel.name || 'chat',
-              messageId: message.id,
-              authorId: message.author?.id || '0',
-              authorTag: message.author?.tag || message.author?.username || 'Unknown',
-              postedAt: message.createdTimestamp || Date.now(),
-            });
+            if (isLinkBackupChannel(channel)) {
+              saveLinkRecord({
+                normalizedUrl,
+                originalUrl,
+                guildId: channel.guildId || null,
+                channelId: channel.id,
+                channelName: channel.name || 'chat',
+                messageId: message.id,
+                authorId: message.author?.id || '0',
+                authorTag: message.author?.tag || message.author?.username || 'Unknown',
+                postedAt: message.createdTimestamp || Date.now(),
+                content: message.content || null,
+              });
+            }
           }
         }
       }
@@ -506,8 +512,8 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
                   fileName: path.basename(archivedPath),
                 });
 
-                // Save to SQLite link database
-                if (normalized) {
+                // Save to SQLite link database (only for backup-eligible channels)
+                if (normalized && isLinkBackupChannel(channel)) {
                   saveLinkRecord({
                     normalizedUrl: normalized,
                     originalUrl: link.url,
@@ -518,6 +524,7 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
                     authorId,
                     authorTag,
                     postedAt,
+                    content: message.content || null,
                   });
                 }
 

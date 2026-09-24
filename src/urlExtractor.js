@@ -182,8 +182,8 @@ const TRACKING_PARAMS = new Set([
 
 export function stripQueryAndTrailingPunctuation(rawUrl) {
   // Strip common trailing punctuation that gets swept up by the regex
-  // (e.g. a link at the end of a sentence followed by a period, brackets, or wrapping quotes).
-  return rawUrl.replace(/[.,!?;:)'"]+$/g, '');
+  // (e.g. a link at the end of a sentence followed by a period, brackets, wrapping quotes, or spoiler pipes).
+  return rawUrl.replace(/[.,!?;:)'"|]+$/g, '');
 }
 
 function getExtension(pathname) {

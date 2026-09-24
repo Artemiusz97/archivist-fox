@@ -6,15 +6,18 @@ import {
   ContextMenuCommandBuilder,
   ApplicationCommandType,
   EmbedBuilder,
+  AttachmentBuilder,
   PermissionFlagsBits,
   ChannelType,
 } from 'discord.js';
 import { config, isChannelAllowed } from './config.js';
-import { getDb } from './linkDb.js';
+import { getDb, getDistinctLinkChannels } from './linkDb.js';
 import { getBestVideoEncoder } from './compress.js';
 import { handleMessage } from './mediaHandler.js';
 import { downloadQueue } from './queue.js';
 import { crawlChannel, isScanRunning, setScanRunning, stopActiveTasks, isStopRequested } from './scanner.js';
+import { exportLinks } from './linkExporter.js';
+import { restoreLinks, isRestoreRunning } from './linkRestorer.js';
 
 function runCmdOutput(cmd, args) {
   return new Promise((resolve) => {
@@ -137,12 +140,87 @@ export function getCommandDefinitions() {
         .setMaxValue(8)
     );
 
+  const exportLinksCommand = new SlashCommandBuilder()
+    .setName('export-links')
+    .setDescription('Export saved link archives to portable JSON, Markdown, and CSV files')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
+    .addStringOption((opt) =>
+      opt
+        .setName('channel')
+        .setDescription('Specific channel name to export, or "all" (default: "all")')
+        .setAutocomplete(true)
+        .setRequired(false)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName('format')
+        .setDescription('Format to export (default: all)')
+        .setRequired(false)
+        .addChoices(
+          { name: 'All Formats (JSON, Markdown, CSV)', value: 'all' },
+          { name: 'JSON only', value: 'json' },
+          { name: 'Markdown only (.md)', value: 'markdown' },
+          { name: 'CSV only (.csv)', value: 'csv' }
+        )
+    );
+
+  const buildRestoreCommand = (cmdName) =>
+    new SlashCommandBuilder()
+      .setName(cmdName)
+      .setDescription('Restore and repost backed-up links into Discord channels')
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+      .addStringOption((opt) =>
+        opt
+          .setName('source')
+          .setDescription('Backed-up channel to restore from (or "all")')
+          .setAutocomplete(true)
+          .setRequired(true)
+      )
+      .addChannelOption((opt) =>
+        opt
+          .setName('target_channel')
+          .setDescription('(Optional) Target channel. Defaults to THIS current channel!')
+          .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+          .setRequired(false)
+      )
+      .addBooleanOption((opt) =>
+        opt
+          .setName('auto_create_channels')
+          .setDescription('Auto-create a channel in Discord if the backup source channel does not exist yet')
+          .setRequired(false)
+      )
+      .addBooleanOption((opt) =>
+        opt
+          .setName('attribution')
+          .setDescription('Include original author and date in reposted message footer')
+          .setRequired(false)
+      )
+      .addBooleanOption((opt) =>
+        opt
+          .setName('dry_run')
+          .setDescription('Test and simulate channel mapping without actually sending messages')
+          .setRequired(false)
+      );
+
+  const restoreCommand = buildRestoreCommand('restore');
+  const restoreLinksCommand = buildRestoreCommand('restore-links');
+
   const stopCommand = new SlashCommandBuilder()
     .setName('stop')
-    .setDescription('Stops any currently running rescan, crawl, or queued background tasks')
+    .setDescription('Stops any currently running rescan, crawl, restoration, or queued background tasks')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages);
 
-  return [helpCommand, contextMenu, statusCommand, statsCommand, rescanCommand, stopCommand];
+  return [
+    helpCommand,
+    contextMenu,
+    statusCommand,
+    statsCommand,
+    rescanCommand,
+    exportLinksCommand,
+    restoreCommand,
+    restoreLinksCommand,
+    stopCommand,
+  ];
 }
 
 /**
@@ -185,8 +263,10 @@ export function getHelpEmbed() {
           '• **`/help`** — Displays this list of commands and functions.',
           '• **`/status`** — Live diagnostics: scraper versions (yt-dlp, gallery-dl), GPU hardware encoder, database record counts, and archive disk usage.',
           '• **`/stats`** — Server-wide archiving analytics (total links, files preserved, top channels, and top uploaders).',
+          '• **`/export-links [channel] [format]`** — Export saved links into portable JSON, Markdown, and CSV backup files.',
+          '• **`/restore <source> [target]`** (or `/restore-links`) — Repost saved links into current or target channel (with autocomplete!).',
           '• **`/rescan [channel] [limit] [missing_only] [force]`** — Scans message history to bulk-archive media to PC and backfill missed uploads.',
-          '• **`/stop`** — Stops any currently running channel rescan, media crawl, or queued background tasks.',
+          '• **`/stop`** — Stops any currently running channel rescan, restore session, or queued tasks.',
         ].join('\n'),
         inline: false,
       },
@@ -203,6 +283,7 @@ export function getHelpEmbed() {
         value: [
           `• **Reply with \`${config.retryCommand}\`** — Retry downloading media if a post was missed.`,
           `• **Reply with \`${config.reupCommand}\`** — Force re-upload media, bypassing duplicate checks.`,
+          `• **\`!restore <channel>\`** — Restore backed-up links directly into THIS channel!`,
           `• **\`${config.rescanCommand}\` / \`!crawl\`** — Crawl message history in the current channel.`,
           `• **\`${config.rescanCommand} #channel\`** — Crawl a specific channel.`,
           `• **\`${config.rescanCommand} all\`** — Server-wide historical crawl across all readable channels.`,
@@ -234,6 +315,38 @@ export function getHelpEmbed() {
  */
 export async function handleInteraction(interaction) {
   try {
+    // 0. Autocomplete Interactions (e.g. suggesting source channel names)
+    if (interaction.isAutocomplete()) {
+      const { commandName } = interaction;
+      if (['restore', 'restore-links', 'export-links'].includes(commandName)) {
+        const focused = interaction.options.getFocused(true);
+        if (focused.name === 'source' || focused.name === 'source_channel' || focused.name === 'channel') {
+          const distinct = getDistinctLinkChannels();
+          const query = (focused.value || '').toLowerCase().replace(/^#/, '');
+          const choices = [];
+
+          if (commandName.startsWith('restore') && ('all'.includes(query) || !query)) {
+            choices.push({ name: '🌐 All Channels (Full Server Restore)', value: 'all' });
+          } else if (commandName === 'export-links' && ('all'.includes(query) || !query)) {
+            choices.push({ name: '🌐 All Channels', value: 'all' });
+          }
+
+          for (const ch of distinct) {
+            const chName = ch.channel_name;
+            if (chName.toLowerCase().includes(query)) {
+              choices.push({
+                name: `#${chName} (${ch.count.toLocaleString()} link${ch.count === 1 ? '' : 's'})`,
+                value: chName,
+              });
+              if (choices.length >= 25) break;
+            }
+          }
+          await interaction.respond(choices.slice(0, 25)).catch(() => {});
+        }
+      }
+      return;
+    }
+
     // 1. Button Interactions (e.g. Dismiss button or Delete Post on duplicate alert)
     if (interaction.isButton()) {
       if (interaction.customId.startsWith('dismiss_alert:')) {
@@ -627,6 +740,198 @@ export async function handleInteraction(interaction) {
         return;
       }
 
+      if (commandName === 'export-links') {
+        const isMod =
+          interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages) ||
+          interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
+          interaction.guild?.ownerId === interaction.user.id;
+
+        if (!isMod) {
+          await interaction.reply({
+            content: '❌ You need the `Manage Messages` or `Administrator` permission to export link backups.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        await interaction.deferReply();
+
+        const channel = interaction.options.getString('channel') || 'all';
+        const format = interaction.options.getString('format') || 'all';
+
+        try {
+          const result = await exportLinks({ channel, format });
+
+          if (!result.success) {
+            await interaction.editReply({
+              content: `⚠️ ${result.summary}`,
+            });
+            return;
+          }
+
+          const embed = new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle('📦 Link Archive Export Complete')
+            .setDescription(result.summary)
+            .addFields(
+              {
+                name: '📊 Summary',
+                value: [
+                  `**Total Links:** \`${result.totalLinks.toLocaleString()}\``,
+                  `**Channels Exported:** \`${result.channelsExported.length}\``,
+                  `**Format:** \`${format.toUpperCase()}\``,
+                  `**Directory:** \`${config.linkBackupDir}\``,
+                ].join('\n'),
+                inline: false,
+              },
+              {
+                name: '📁 Channels Included',
+                value:
+                  result.channelsExported.slice(0, 10).map((c) => `• #${c}`).join('\n') +
+                  (result.channelsExported.length > 10 ? `\n_…and ${result.channelsExported.length - 10} more_` : ''),
+                inline: false,
+              }
+            )
+            .setFooter({ text: `Archivist Fox v${config.version}` })
+            .setTimestamp();
+
+          // Prepare attachments if within upload size limit
+          const filesToAttach = [];
+          if (result.masterJsonPath && fs.existsSync(result.masterJsonPath)) {
+            const size = (await fs.promises.stat(result.masterJsonPath)).size;
+            if (size <= config.maxFileSizeBytes) {
+              filesToAttach.push(new AttachmentBuilder(result.masterJsonPath, { name: path.basename(result.masterJsonPath) }));
+            }
+          }
+
+          // If a single channel was exported and markdown exists, attach it too
+          if (result.channelsExported.length === 1) {
+            const mdFile = result.files.find((f) => f.endsWith('.md'));
+            if (mdFile && fs.existsSync(mdFile)) {
+              const size = (await fs.promises.stat(mdFile)).size;
+              if (size <= config.maxFileSizeBytes) {
+                filesToAttach.push(new AttachmentBuilder(mdFile, { name: path.basename(mdFile) }));
+              }
+            }
+          }
+
+          await interaction.editReply({
+            embeds: [embed],
+            files: filesToAttach,
+          });
+        } catch (err) {
+          console.error('[Commands] Export error:', err);
+          await interaction.editReply({ content: `❌ Export failed: ${err.message}` });
+        }
+        return;
+      }
+
+      if (commandName === 'restore' || commandName === 'restore-links') {
+        if (!interaction.guild) {
+          await interaction.reply({
+            content: '❌ Link restoration can only be used inside a server, not in DMs.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        const isAdmin =
+          interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
+          interaction.guild?.ownerId === interaction.user.id;
+
+        if (!isAdmin) {
+          await interaction.reply({
+            content: '❌ You need the `Administrator` permission to restore and repost links.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        if (isRestoreRunning()) {
+          await interaction.reply({
+            content: '⚠️ A link restoration task is already in progress. Please wait for it or use `/stop` to cancel.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        const sourceChannel =
+          interaction.options.getString('source') ||
+          interaction.options.getString('source_channel');
+        let targetChannel = interaction.options.getChannel('target_channel') || null;
+        const autoCreate = interaction.options.getBoolean('auto_create_channels') || false;
+        const attribution = interaction.options.getBoolean('attribution') || false;
+        const dryRun = interaction.options.getBoolean('dry_run') || false;
+
+        // If user didn't specify a target channel and is restoring a single channel,
+        // automatically default to the CURRENT channel where they entered the command!
+        if (!targetChannel && sourceChannel !== 'all') {
+          targetChannel = interaction.channel;
+        }
+
+        await interaction.deferReply();
+
+        let lastEditTime = Date.now();
+        const onProgress = async (progress) => {
+          const now = Date.now();
+          if (now - lastEditTime > 4000) {
+            lastEditTime = now;
+            await interaction
+              .editReply({
+                content: `⏳ **Restoring links...**\n• Processing: **#${progress.channelName}**\n• Progress: **${progress.current}/${progress.total}** (${Math.round((progress.current / progress.total) * 100)}%)\n• Reposted: **${progress.postedCount}** | Skipped: **${progress.skippedCount}**`,
+              })
+              .catch(() => {});
+          }
+        };
+
+        try {
+          const result = await restoreLinks({
+            guild: interaction.guild,
+            sourceChannel,
+            targetChannel,
+            autoCreateChannels: autoCreate,
+            includeAttribution: attribution,
+            dryRun,
+            onProgress,
+          });
+
+          const embed = new EmbedBuilder()
+            .setColor(result.success ? 0x2ecc71 : 0xe74c3c)
+            .setTitle(dryRun ? '🔍 Link Restoration — Dry Run Preview' : '🔄 Link Restoration Complete')
+            .setDescription(result.summary)
+            .addFields(
+              {
+                name: '📊 Restoration Details',
+                value: [
+                  `**Source Channel(s):** \`${sourceChannel}\``,
+                  `**Target:** \`${targetChannel ? targetChannel.name : 'Matched by name'}\``,
+                  `**Total Links Processed:** \`${result.totalLinks.toLocaleString()}\``,
+                  `**Successfully Reposted:** \`${result.postedCount.toLocaleString()}\``,
+                  `**Skipped:** \`${result.skippedCount.toLocaleString()}\``,
+                  `**Channels Processed:** \`${result.channelsProcessed.map((c) => `#${c}`).join(', ') || 'None'}\``,
+                ].join('\n'),
+                inline: false,
+              }
+            )
+            .setFooter({ text: `Archivist Fox v${config.version}` })
+            .setTimestamp();
+
+          if (result.createdChannels.length > 0) {
+            embed.addFields({
+              name: '✨ Recreated Channels',
+              value: result.createdChannels.map((c) => `• #${c}`).join('\n'),
+              inline: false,
+            });
+          }
+
+          await interaction.editReply({ content: null, embeds: [embed] });
+        } catch (err) {
+          console.error('[Commands] Restore error:', err);
+          await interaction.editReply({ content: `❌ Restoration failed: ${err.message}` });
+        }
+        return;
+      }
+
       if (commandName === 'stop') {
         const isMod =
           interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages) ||
@@ -642,15 +947,16 @@ export async function handleInteraction(interaction) {
         }
 
         const stopped = stopActiveTasks();
-        if (stopped.scanRunning || stopped.playlistRunning || stopped.queueItemsCleared > 0) {
+        if (stopped.scanRunning || stopped.playlistRunning || stopped.restoreRunning || stopped.queueItemsCleared > 0) {
           let msg = '🛑 **Stopped active tasks:**\n';
           if (stopped.scanRunning) msg += '• Aborted active channel rescan / media crawl.\n';
+          if (stopped.restoreRunning) msg += '• Aborted active link restoration / reposting.\n';
           if (stopped.playlistRunning) msg += '• Aborted active playlist download.\n';
           if (stopped.queueItemsCleared > 0) msg += `• Cleared **${stopped.queueItemsCleared}** queued download(s).\n`;
           await interaction.reply({ content: msg });
         } else {
           await interaction.reply({
-            content: 'ℹ️ No active rescan, playlist download, or queued tasks are currently running.',
+            content: 'ℹ️ No active rescan, playlist download, restoration, or queued tasks are currently running.',
             ephemeral: true,
           });
         }

@@ -110,6 +110,9 @@ the media, and replies to the original poster with it as a file attachment.
 | `SELF_REPOST_GRACE_SECONDS` | `300` | Grace window (seconds) to ignore duplicate warnings if same user reposts/edits |
 | `DUPLICATE_LINK_ALERT_TTL_SECONDS` | `0` | Auto-delete duplicate link alert notices after this many seconds (`0` = never delete) |
 | `LINK_DB_PATH` | `./data/links.db` | SQLite database file path for tracking posted links |
+| `LINK_BACKUP_CHANNELS` | (all) | Comma-separated channel names or IDs to export/backup (leave blank for all) |
+| `LINK_BACKUP_DIR` | `./backups/links` | Local destination folder for link exports (JSON, Markdown, CSV) |
+| `RESTORE_PACE_DELAY_MS` | `1500` | Delay in milliseconds between reposting links during restoration to respect rate limits |
 | `RESCAN_COMMAND` | `!rescan` | Command to crawl past channel/server history and batch-archive media to PC |
 | `SCANNER_CONCURRENCY` | `3` | Number of parallel download workers during a channel rescan/crawl |
 | `AUTO_SCAN_ON_STARTUP` | `true` | Automatically scan recent messages on startup to catch up on links posted while PC was off |
@@ -142,8 +145,13 @@ Archivist Fox includes modern Discord Application Commands:
 - **`/rescan [channel] [limit] [missing_only] [force] [concurrency]`**:
   - Interactive slash command to scan channel message history and bulk-archive media directly from Discord.
   - Prefix command equivalent: `!rescan 500 --repost-missing -c 4` (use `-c` or `--concurrency` to control parallel download speed).
+- **`/export-links [channel] [format]`**:
+  - Export tracked server links to structured JSON, Markdown tables, or CSV spreadsheets with rich summary embeds and direct file attachments.
+- **`/restore [source_channel] [target_channel] [auto_create_channels] [attribution] [dry_run]`**:
+  - Disaster recovery tool that reposts links from backup files sequentially into Discord channels with rate-limit safe pacing and channel auto-creation.
+  - Prefix command equivalent: `!restore misc-links` (or `!restore all`).
 - **`/stop`**:
-  - Immediately aborts and halts any running `/rescan` channel crawl, bulk archiving session, or queued background tasks.
+  - Immediately aborts and halts any running `/rescan` channel crawl, `/restore` link restoration session, bulk archiving, or queued background tasks.
 - **Duplicate Notice "Delete Post" & "Dismiss" Buttons**:
   - When all links in a message are duplicates, the bot attaches both a `🗑️ Delete Post` button and a `✖️ Dismiss` button. The original poster or server moderators can delete the duplicate message and alert in one click.
 
@@ -220,6 +228,47 @@ To download high-resolution Pixiv illustrations and multi-image manga works with
 2. Follow the prompt in your browser to log into Pixiv, right-click the login button, copy the callback URL, and paste it back into the terminal.
 3. The script automatically writes `PIXIV_REFRESH_TOKEN` to `.env` and configures gallery-dl.
 4. For detailed step-by-step instructions, see [`PIXIV_LOGIN_GUIDE.txt`](PIXIV_LOGIN_GUIDE.txt).
+
+## Link Backup & Disaster Recovery (`/export-links` & `/restore`)
+
+Archivist Fox includes an export, backup, and disaster-recovery engine for your server's link database:
+
+### 1. Multi-Format Link Exports (`/export-links` or CLI)
+Export your link history at any time directly through Discord or the terminal:
+- **Discord Slash Command**: `/export-links [channel] [format]` (JSON, Markdown, or CSV) displays a statistical summary embed and attaches downloadable backup files.
+- **Command-Line Interface**: Run `npm run export-links` (or `node scripts/export_links.js [channel] [format]`).
+- **Formats Generated** (saved to `./backups/links`):
+  - **Master JSON**: `links_backup_<timestamp>.json` and `latest.json` containing complete metadata and user message commentary context.
+  - **Per-Channel JSON**: `channels/<channel>.json` for individual channel archives.
+  - **Human-Readable Markdown**: `markdown/<channel>.md` formatted as neat Markdown tables with links, user tags, timestamps, and message comments.
+  - **Spreadsheet CSV**: `csv/<channel>.csv` for analysis in Excel or Google Sheets.
+
+### 2. Automated Link Restoration & Reposting (`/restore` or CLI)
+If a Discord channel is accidentally deleted, wiped, or you are migrating links:
+- **Discord Slash Command**: `/restore source_channel:misc-links target_channel:#misc-links`
+  - Interactive autocomplete for available backup channels.
+  - Live in-place status editing as links are reposted.
+- **Chat Prefix Shortcut**: `!restore misc-links` (reposts links directly into the current channel).
+- **Command-Line Tool**: Run `npm run restore-links -- --channel=misc-links --guild=YOUR_GUILD_ID` with options `--auto-create`, `--attribution`, and `--dry-run`.
+- **Channel Auto-Creation (`auto_create_channels: true`)**: Automatically recreates missing text channels if they were deleted.
+- **Author Attribution (`attribution: true`)**: Attaches `(originally shared by @User on YYYY-MM-DD)` alongside original message commentary.
+- **Rate-Limit Safe**: Automatically paces reposting (`RESTORE_PACE_DELAY_MS=1500`) to strictly avoid Discord API rate limits.
+- **Cancel Anytime**: Full support for `/stop` or `!stop` to halt an active restoration task.
+
+## Running Tests
+
+Archivist Fox includes a native test suite with 69 unit and integration tests covering commands, configuration, database operations, export formatting, and URL extraction:
+
+```bash
+# Run all tests
+npm test
+
+# Run tests in watch mode during development
+npm run test:watch
+
+# Run tests with code coverage analysis
+npm run test:coverage
+```
 
 ## Retrying and Re-uploading links
 

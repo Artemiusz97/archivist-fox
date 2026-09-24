@@ -131,6 +131,13 @@ export const config = {
   selfRepostGraceSeconds: Math.max(0, Number(process.env.SELF_REPOST_GRACE_SECONDS || 300)),
   duplicateLinkAlertTtlSeconds: Math.max(0, Number(process.env.DUPLICATE_LINK_ALERT_TTL_SECONDS || 0)),
   linkDbPath: process.env.LINK_DB_PATH || path.join(process.cwd(), 'data', 'links.db'),
+  // Link Backup & Disaster Recovery System
+  linkBackupChannels: (process.env.LINK_BACKUP_CHANNELS || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase().replace(/^#/, ''))
+    .filter(Boolean),
+  linkBackupDir: process.env.LINK_BACKUP_DIR || path.join(process.cwd(), 'backups', 'links'),
+  restorePaceDelayMs: Math.max(500, Number(process.env.RESTORE_PACE_DELAY_MS || 1500)),
   // Startup Automatic History Catch-Up Scan configuration
   autoScanOnStartup: parseBool(process.env.AUTO_SCAN_ON_STARTUP, true),
   autoScanHours: Math.max(1, Number(process.env.AUTO_SCAN_HOURS || 24)),
@@ -180,6 +187,54 @@ export function isChannelAllowed(channelId) {
     return !config.disallowedChannelIds.includes(channelId);
   }
   return true;
+}
+
+/**
+ * Normalizes a channel name for loose comparison by stripping leading '#' characters,
+ * converting whitespace to hyphens, and removing special symbols/emojis.
+ *
+ * @param {string} name
+ * @returns {string}
+ */
+export function normalizeChannelName(name) {
+  if (!name) return '';
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/^#/, '')
+    .replace(/\s+/g, '-')
+    .replace(/[^\p{L}\p{N}_-]/gu, '')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+/**
+ * Checks whether a channel is targeted for link backup.
+ * Matches against exact channel ID, exact channel name, or normalized name (ignoring emojis/symbols).
+ * If LINK_BACKUP_CHANNELS is not set, all allowed channels are backed up by default.
+ *
+ * @param {import('discord.js').Channel|{ id: string, name?: string }} channel
+ * @returns {boolean}
+ */
+export function isLinkBackupChannel(channel) {
+  if (!channel) return false;
+  // If no specific backup channels configured, default to all allowed channels
+  if (config.linkBackupChannels.length === 0) {
+    return isChannelAllowed(channel.id);
+  }
+  const channelId = channel.id;
+  const channelName = (channel.name || '').toLowerCase().replace(/^#/, '');
+  const slugName = normalizeChannelName(channel.name);
+
+  return config.linkBackupChannels.some((target) => {
+    // 1. Exact snowflake ID
+    if (target === channelId) return true;
+    // 2. Exact name match (ignoring leading '#')
+    if (target === channelName) return true;
+    // 3. Slug match (stripping emojis/symbols for human-friendly .env entries)
+    if (slugName && normalizeChannelName(target) === slugName) return true;
+    return false;
+  });
 }
 
 if (config.allowedChannelIds.length > 0 && config.disallowedChannelIds.length > 0) {

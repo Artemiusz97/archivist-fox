@@ -49,3 +49,6 @@ scratch/
 # Distribution & Release Archives
 releases/
 dist/
+
+# Link Backups (Local exports)
+backups/

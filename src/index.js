@@ -2,12 +2,13 @@ import { Client, Events, GatewayIntentBits, Partials, PermissionFlagsBits } from
 import { config, isChannelAllowed, requireDiscordToken } from './config.js';
 import { handleMessage } from './mediaHandler.js';
 import { processMessageLinks } from './linkDetector.js';
-import { initLinkDb, pruneExpiredLinks, closeLinkDb, checkpointWal } from './linkDb.js';
+import { initLinkDb, pruneExpiredLinks, closeLinkDb, checkpointWal, getDistinctLinkChannels } from './linkDb.js';
 import { scheduleAutoDelete, scheduleCommandMessageDelete, cleanupStaleTempDirs } from './utils.js';
 import { ensureBinaries } from './ensureBinaries.js';
 import { initAutoUpdater } from './autoUpdater.js';
 import { handleRescanCommand, stopActiveTasks, runStartupScan } from './scanner.js';
 import { registerCommands, handleInteraction, getHelpEmbed } from './commands.js';
+import { restoreLinks, isRestoreRunning } from './linkRestorer.js';
 import { startWebServer } from './web/server.js';
 
 const client = new Client({
@@ -167,16 +168,17 @@ client.on('messageCreate', async (message) => {
       }
 
       const stopped = stopActiveTasks();
-      if (stopped.scanRunning || stopped.playlistRunning || stopped.queueItemsCleared > 0) {
+      if (stopped.scanRunning || stopped.playlistRunning || stopped.restoreRunning || stopped.queueItemsCleared > 0) {
         let msg = '🛑 **Stopped active tasks:**\n';
         if (stopped.scanRunning) msg += '• Aborted active channel rescan / media crawl.\n';
+        if (stopped.restoreRunning) msg += '• Aborted active link restoration / reposting.\n';
         if (stopped.playlistRunning) msg += '• Aborted active playlist download.\n';
         if (stopped.queueItemsCleared > 0) msg += `• Cleared **${stopped.queueItemsCleared}** queued download(s).\n`;
         const notice = await message.reply({ content: msg, allowedMentions: { repliedUser: false } });
         scheduleAutoDelete(notice);
       } else {
         const notice = await message.reply({
-          content: 'ℹ️ No active rescan, playlist download, or queued tasks are currently running.',
+          content: 'ℹ️ No active rescan, playlist download, restoration, or queued tasks are currently running.',
           allowedMentions: { repliedUser: false },
         });
         scheduleAutoDelete(notice);
@@ -193,6 +195,87 @@ client.on('messageCreate', async (message) => {
     if (isRescanCommand(message.content)) {
       scheduleCommandMessageDelete(message);
       await handleRescanCommand(message);
+      return;
+    }
+
+    if (message.content.trim().toLowerCase().startsWith('!restore')) {
+      scheduleCommandMessageDelete(message);
+      const isMod =
+        message.member?.permissions?.has(PermissionFlagsBits.Administrator) ||
+        message.guild?.ownerId === message.author.id;
+
+      if (!isMod) {
+        const notice = await message.reply({
+          content: '❌ You need the `Administrator` permission to restore and repost links.',
+          allowedMentions: { repliedUser: false },
+        });
+        scheduleAutoDelete(notice);
+        return;
+      }
+
+      if (isRestoreRunning()) {
+        const notice = await message.reply({
+          content: '⚠️ A link restoration task is already in progress. Please wait for it or use `!stop` to cancel.',
+          allowedMentions: { repliedUser: false },
+        });
+        scheduleAutoDelete(notice);
+        return;
+      }
+
+      const parts = message.content.trim().split(/\s+/);
+      const sourceChannel = parts[1];
+
+      if (!sourceChannel) {
+        const distinct = getDistinctLinkChannels();
+        const channelList = distinct
+          .slice(0, 15)
+          .map((c) => `• \`!restore ${c.channel_name}\` (${c.count.toLocaleString()} link${c.count === 1 ? '' : 's'})`)
+          .join('\n');
+        const notice = await message.reply({
+          content: `💡 **How to restore links into THIS channel:**\nSend \`!restore <source_channel>\` inside the channel where you want the links reposted.\n\n**Available channels in backup:**\n${channelList}${distinct.length > 15 ? `\n_…and ${distinct.length - 15} more channels._` : ''}\n\n_Tip: You can also use \`/restore\` for interactive autocomplete!_`,
+          allowedMentions: { repliedUser: false },
+        });
+        scheduleAutoDelete(notice);
+        return;
+      }
+
+      const progressNotice = await message.reply({
+        content: `⏳ Starting link restoration for **#${sourceChannel}** into this channel...`,
+        allowedMentions: { repliedUser: false },
+      });
+
+      let lastEdit = Date.now();
+      const onProgress = async (prog) => {
+        const now = Date.now();
+        if (now - lastEdit > 4000) {
+          lastEdit = now;
+          await progressNotice
+            .edit({
+              content: `⏳ **Restoring links...** [${prog.current}/${prog.total}] links reposted into this channel...`,
+            })
+            .catch(() => {});
+        }
+      };
+
+      try {
+        const result = await restoreLinks({
+          guild: message.guild,
+          sourceChannel,
+          targetChannel: message.channel,
+          onProgress,
+        });
+
+        await progressNotice.edit({
+          content: `${result.summary}\n*(Target channel: ${message.channel})*`,
+        });
+
+        // Auto-delete the notice after 60 seconds so it doesn't clutter the channel
+        const ttl = Math.max(15000, (config.errorMessageTtlMs || 30000) * 2);
+        setTimeout(() => progressNotice.delete().catch(() => {}), ttl);
+      } catch (err) {
+        await progressNotice.edit({ content: `❌ Restoration failed: ${err.message}` });
+        scheduleAutoDelete(progressNotice);
+      }
       return;
     }
 

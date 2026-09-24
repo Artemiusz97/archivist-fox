@@ -23,6 +23,7 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 
 | Version | Release Date | Type | Primary Milestone / Theme |
 | :--- | :--- | :--- | :--- |
+| **[v3.11.0](#v3110---2026-09-24)** | 2026-09-24 | Minor | Link Backup & Disaster Recovery Suite: Multi-format link exporter (JSON, Markdown, CSV), automated link restoration & reposting engine (`/restore`, `!restore`, CLI), message context preservation, channel slug normalization, and comprehensive 69-test native suite. |
 | **[v3.10.0](#v3100---2026-09-22)** | 2026-09-22 | Minor | Web UI & Downloader Dashboard, NSFW Auto-Spoiler Engine, Per-Link Streaming Uploads, Interactive Duplicate Cleanup (`Delete Post`), Force Re-upload (`!reup`), Auto-Delete Command Messages, Pixiv OAuth Helper. |
 | **[v3.9.0](#v390---2026-09-18)** | 2026-09-18 | Minor | YouTube Playlist & Subtitle Suite: Interactive playlist prompt buttons, auto-threading, creator/auto-generated subtitle extraction & zip bundling. |
 | **[v3.8.0](#v380---2026-09-17)** | 2026-09-17 | Minor | DeviantArt Platform Expansion: Native DeviantArt & Sta.sh scraping, fav.me base-36 canonical unshortening, gallery-dl fast-path routing, DeviantArt cookie vault. |
@@ -50,6 +51,33 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 ---
 
 ## Release Details
+
+### [v3.11.0] - 2026-09-24
+
+#### Added & Improved
+- **Link Backup & Disaster Recovery System (`src/linkExporter.js`, `scripts/export_links.js`, `src/config.js`, `.env.example`, `.gitignore`)**:
+  - Added full link exporter engine to export all saved links into Master JSON (`links_backup_<timestamp>.json` and `latest.json`), per-channel JSON (`backups/links/channels/<channel>.json`), Markdown tables (`backups/links/markdown/<channel>.md`), and CSVs (`backups/links/csv/<channel>.csv`).
+  - Added `/export-links` slash command with rich embed summary and automatic file attachment upload.
+  - Added CLI tool `npm run export-links [channel] [format]` (`scripts/export_links.js`).
+  - Granular channel filtering via `LINK_BACKUP_CHANNELS` and custom destination path via `LINK_BACKUP_DIR`.
+- **Automated Link Restoration & Reposting Engine (`src/linkRestorer.js`, `scripts/restore_links.js`, `src/commands.js`, `src/index.js`)**:
+  - Automated sequentially paced link reposting into Discord text channels from previous backups.
+  - Added `/restore` slash command with interactive autocomplete for backup channels and live status editing.
+  - Added `!restore <source_channel>` chat prefix shortcut for quick in-channel restoration.
+  - Added terminal-based restore tool (`scripts/restore_links.js`) with `--auto-create`, `--attribution`, `--dry-run`, and pacing controls.
+  - Rate-limit safe pacing (`RESTORE_PACE_DELAY_MS=1500`) to strictly respect Discord rate limits.
+  - Channel auto-creation for missing text channels and original author attribution options.
+  - Full task cancellation support via `/stop` and `!stop`.
+- **Message Context Preservation in Link Database (`src/linkDb.js`, `src/linkDetector.js`, `src/scanner.js`)**:
+  - Added `content TEXT` column to `posted_links` SQLite table with automatic dynamic database migration.
+  - Preserves user message commentary alongside detected links across live chat and `/rescan` crawls.
+  - Added batch insert transaction support (`saveLinkRecordBatch`) and grouped query methods.
+- **Channel Name Normalization & Slug Engine (`src/config.js`)**:
+  - Added `normalizeChannelName(name)` helper to strip leading `#`, emojis, unicode symbols, and collapse whitespace into clean slugs.
+  - Added `isLinkBackupChannel(channel)` to evaluate channel backup eligibility seamlessly across IDs, names, and formatted titles.
+- **Comprehensive Native Test Suite (`tests/`, `package.json`)**:
+  - 69 native unit and integration tests using Node.js's built-in test runner (`node --test`), covering commands, configuration, database transactions, export formatting, channel matching, title validation, URL parsing, and NSFW/spoiler detection.
+  - Added npm test scripts: `npm test`, `npm run test:watch`, `npm run test:coverage`.
 
 ### [v3.10.0] - 2026-09-22
 

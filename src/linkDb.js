@@ -47,7 +47,8 @@ export function initLinkDb(customPath) {
       message_id TEXT NOT NULL,
       author_id TEXT NOT NULL,
       author_tag TEXT NOT NULL,
-      posted_at INTEGER NOT NULL
+      posted_at INTEGER NOT NULL,
+      content TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_links_url_channel ON posted_links (normalized_url, channel_id);
@@ -74,6 +75,14 @@ export function initLinkDb(customPath) {
     CREATE INDEX IF NOT EXISTS idx_media_duration ON media_records (duration);
   `);
 
+  // Migration for existing databases created prior to content column
+  try {
+    const tableInfo = dbInstance.prepare("PRAGMA table_info(posted_links)").all();
+    if (!tableInfo.some((col) => col.name === 'content')) {
+      dbInstance.exec('ALTER TABLE posted_links ADD COLUMN content TEXT;');
+    }
+  } catch {}
+
   // Cache hot prepared statements on the instance so SQLite doesn't re-parse
   // and compile the same SQL strings on every chat message and crawl iteration.
   dbInstance._stmts = {
@@ -84,10 +93,10 @@ export function initLinkDb(customPath) {
       'SELECT * FROM posted_links WHERE normalized_url = ? AND guild_id = ? AND posted_at >= ? ORDER BY posted_at ASC LIMIT 1'
     ),
     insertLink: dbInstance.prepare(
-      'INSERT INTO posted_links (normalized_url, original_url, guild_id, channel_id, channel_name, message_id, author_id, author_tag, posted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      'INSERT INTO posted_links (normalized_url, original_url, guild_id, channel_id, channel_name, message_id, author_id, author_tag, posted_at, content) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
     ),
     updateLink: dbInstance.prepare(
-      'UPDATE posted_links SET message_id = ?, channel_id = ?, channel_name = ?, posted_at = ? WHERE id = ?'
+      'UPDATE posted_links SET message_id = ?, channel_id = ?, channel_name = ?, posted_at = ?, content = ? WHERE id = ?'
     ),
     pruneLinks: dbInstance.prepare('DELETE FROM posted_links WHERE posted_at < ?'),
   };
@@ -169,6 +178,7 @@ export function saveLinkRecord({
   authorId,
   authorTag,
   postedAt = Date.now(),
+  content = null,
 }) {
   const db = getDb();
   const result = db._stmts.insertLink.run(
@@ -180,7 +190,8 @@ export function saveLinkRecord({
     messageId,
     authorId,
     authorTag,
-    postedAt
+    postedAt,
+    content || null
   );
 
   return result.lastInsertRowid;
@@ -192,9 +203,115 @@ export function saveLinkRecord({
  * @param {number} id
  * @param {object} updates
  */
-export function updateLinkRecord(id, { messageId, channelId, channelName, postedAt = Date.now() }) {
+export function updateLinkRecord(id, { messageId, channelId, channelName, postedAt = Date.now(), content = null }) {
   const db = getDb();
-  db._stmts.updateLink.run(messageId, channelId, channelName, postedAt, id);
+  db._stmts.updateLink.run(messageId, channelId, channelName, postedAt, content || null, id);
+}
+
+/**
+ * Returns a list of distinct channel names that have saved links, with summary counts.
+ *
+ * @returns {Array<{ channel_name: string, count: number, earliest: number, latest: number }>}
+ */
+export function getDistinctLinkChannels() {
+  const db = getDb();
+  return db.prepare(`
+    SELECT 
+      channel_name, 
+      COUNT(*) as count, 
+      MIN(posted_at) as earliest, 
+      MAX(posted_at) as latest 
+    FROM posted_links 
+    WHERE channel_name IS NOT NULL AND channel_name != ''
+    GROUP BY channel_name 
+    ORDER BY count DESC
+  `).all();
+}
+
+/**
+ * Retrieves all saved link records for a specific channel name, sorted chronologically.
+ *
+ * @param {string} channelName
+ * @returns {Array<object>}
+ */
+export function getLinksByChannel(channelName) {
+  const db = getDb();
+  return db.prepare(`
+    SELECT * FROM posted_links 
+    WHERE LOWER(channel_name) = LOWER(?) 
+    ORDER BY posted_at ASC
+  `).all(channelName);
+}
+
+/**
+ * Retrieves all saved link records organized into a dictionary grouped by channel name.
+ *
+ * @returns {Record<string, Array<object>>}
+ */
+export function getAllLinksGrouped() {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT * FROM posted_links 
+    ORDER BY posted_at ASC
+  `).all();
+
+  const grouped = {};
+  for (const row of rows) {
+    const ch = row.channel_name || 'general';
+    if (!grouped[ch]) grouped[ch] = [];
+    grouped[ch].push(row);
+  }
+  return grouped;
+}
+
+/**
+ * Returns total count of saved links, optionally filtered by channel name.
+ *
+ * @param {string} [channelName]
+ * @returns {number}
+ */
+export function getTotalLinkCount(channelName = null) {
+  const db = getDb();
+  if (channelName) {
+    return db.prepare('SELECT COUNT(*) as count FROM posted_links WHERE LOWER(channel_name) = LOWER(?)').get(channelName)?.count || 0;
+  }
+  return db.prepare('SELECT COUNT(*) as count FROM posted_links').get()?.count || 0;
+}
+
+/**
+ * Batch inserts link records inside a single SQLite transaction.
+ *
+ * @param {Array<object>} records
+ * @returns {number} Count of inserted records
+ */
+export function saveLinkRecordBatch(records) {
+  if (!records || records.length === 0) return 0;
+  const db = getDb();
+  const insert = db._stmts.insertLink;
+  db.exec('BEGIN TRANSACTION;');
+  let count = 0;
+  try {
+    for (const r of records) {
+      insert.run(
+        r.normalized_url || r.normalizedUrl,
+        r.original_url || r.originalUrl,
+        r.guild_id || r.guildId || null,
+        r.channel_id || r.channelId || '0',
+        r.channel_name || r.channelName || 'chat',
+        r.message_id || r.messageId || '0',
+        r.author_id || r.authorId || '0',
+        r.author_tag || r.authorTag || 'Unknown',
+        r.posted_at || r.postedAt || Date.now(),
+        r.content || null
+      );
+      count++;
+    }
+    db.exec('COMMIT;');
+  } catch (err) {
+    db.exec('ROLLBACK;');
+    throw err;
+  }
+  return count;
 }
 
 /**

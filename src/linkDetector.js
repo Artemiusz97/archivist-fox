@@ -1,5 +1,5 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
-import { config } from './config.js';
+import { config, isLinkBackupChannel } from './config.js';
 import { extractAllUrlsAsync } from './urlExtractor.js';
 import {
   findDuplicateLink,
@@ -59,6 +59,7 @@ export async function processMessageLinks(message) {
         channelId,
         channelName,
         postedAt,
+        content: message.content || null,
       });
       newUrls.push({ originalUrl, normalizedUrl });
     } else if (isDuplicate && record) {
@@ -83,18 +84,21 @@ export async function processMessageLinks(message) {
         `ℹ️ This link was already posted by **@${record.author_tag}** ${channelMention} ${relativeTime}!\n🔗 [Jump to original message](<${jumpUrl}>)`
       );
     } else {
-      // First time seeing this link — save to database
-      saveLinkRecord({
-        normalizedUrl,
-        originalUrl,
-        guildId,
-        channelId,
-        channelName,
-        messageId,
-        authorId,
-        authorTag,
-        postedAt,
-      });
+      // First time seeing this link — save to database if channel is backup-eligible
+      if (isLinkBackupChannel(message.channel)) {
+        saveLinkRecord({
+          normalizedUrl,
+          originalUrl,
+          guildId,
+          channelId,
+          channelName,
+          messageId,
+          authorId,
+          authorTag,
+          postedAt,
+          content: message.content || null,
+        });
+      }
       newUrls.push({ originalUrl, normalizedUrl });
     }
   }
