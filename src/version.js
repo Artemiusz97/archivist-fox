@@ -7,4 +7,4 @@
  * - PATCH (X.Y.Z): Bug fixes, platform adjustments, performance polish, security hardening.
  */
 
-export const BOT_VERSION = '3.11.0';
+export const BOT_VERSION = '3.11.1';

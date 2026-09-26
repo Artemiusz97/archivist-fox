@@ -23,6 +23,7 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 
 | Version | Release Date | Type | Primary Milestone / Theme |
 | :--- | :--- | :--- | :--- |
+| **[v3.11.1](#v3111---2026-09-26)** | 2026-09-26 | Patch | Link Backup Decoupling, Enhanced Crawler Telemetry, Privacy Hardening & Discord.js v14 Modernization. |
 | **[v3.11.0](#v3110---2026-09-24)** | 2026-09-24 | Minor | Link Backup & Disaster Recovery Suite: Multi-format link exporter (JSON, Markdown, CSV), automated link restoration & reposting engine (`/restore`, `!restore`, CLI), message context preservation, channel slug normalization, and comprehensive 69-test native suite. |
 | **[v3.10.0](#v3100---2026-09-22)** | 2026-09-22 | Minor | Web UI & Downloader Dashboard, NSFW Auto-Spoiler Engine, Per-Link Streaming Uploads, Interactive Duplicate Cleanup (`Delete Post`), Force Re-upload (`!reup`), Auto-Delete Command Messages, Pixiv OAuth Helper. |
 | **[v3.9.0](#v390---2026-09-18)** | 2026-09-18 | Minor | YouTube Playlist & Subtitle Suite: Interactive playlist prompt buttons, auto-threading, creator/auto-generated subtitle extraction & zip bundling. |
@@ -51,6 +52,21 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 ---
 
 ## Release Details
+
+### [v3.11.1] - 2026-09-26
+
+#### Added & Improved
+- **Link-Backup Channel Decoupling (`src/index.js`, `src/scanner.js`, `src/commands.js`)**:
+  - Allows channels to be designated as link-backup targets via `LINK_BACKUP_CHANNELS` without needing to be added to `ALLOWED_CHANNEL_IDS`.
+  - Archivist Fox indexes links and message commentary into SQLite for disaster recovery and offline archives, while skipping media downloading and uploading in those specific channels.
+- **Enhanced Channel Crawl Telemetry (`src/scanner.js`, `src/commands.js`)**:
+  - `/rescan` and `!rescan` now track and report `Links Backed Up to Database: N` in real-time progress edits and final completion summaries.
+- **Discord.js v14 Modernization (`src/commands.js`, `src/playlistHandler.js`)**:
+  - Migrated interaction responses from deprecated `ephemeral: true` options to Discord.js's standard `flags: MessageFlags.Ephemeral` across all button components, error notices, and permission checks.
+- **Comprehensive Privacy & Documentation Hardening (`README.md`, `CHANGELOG.md`, `releases/`)**:
+  - Audited and stripped all absolute local filesystem paths across all documentation, guides, and version changelogs.
+  - Enforced clean relative inline code notation for all module references.
+  - Rewrote git repository history to use privacy-protecting GitHub noreply commit author metadata.
 
 ### [v3.11.0] - 2026-09-24
 
