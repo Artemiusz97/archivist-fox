@@ -110,7 +110,7 @@ the media, and replies to the original poster with it as a file attachment.
 | `SELF_REPOST_GRACE_SECONDS` | `300` | Grace window (seconds) to ignore duplicate warnings if same user reposts/edits |
 | `DUPLICATE_LINK_ALERT_TTL_SECONDS` | `0` | Auto-delete duplicate link alert notices after this many seconds (`0` = never delete) |
 | `LINK_DB_PATH` | `./data/links.db` | SQLite database file path for tracking posted links |
-| `LINK_BACKUP_CHANNELS` | (all) | Comma-separated channel names or IDs to export/backup (leave blank for all) |
+| `LINK_BACKUP_CHANNELS` | (all) | Comma-separated channels to backup (leave blank for all). If not in `ALLOWED_CHANNEL_IDS`, links are indexed to SQLite without downloading media (zero-intrusion mode) |
 | `LINK_BACKUP_DIR` | `./backups/links` | Local destination folder for link exports (JSON, Markdown, CSV) |
 | `RESTORE_PACE_DELAY_MS` | `1500` | Delay in milliseconds between reposting links during restoration to respect rate limits |
 | `RESCAN_COMMAND` | `!rescan` | Command to crawl past channel/server history and batch-archive media to PC |
@@ -169,6 +169,8 @@ You can crawl past message history across channels or the entire server to downl
 - `!rescan --missing` &mdash; Same as `!repost-missing` (archives to PC and reposts missing media to Discord).
 - `!rescan all --upload` &mdash; Re-uploads attachments for all messages in Discord.
 - `!rescan --force` &mdash; Re-downloads and re-indexes all media even if already in database.
+
+During any `/rescan` or `!rescan` operation, the bot provides real-time live telemetry tracking messages scanned, media attachments uploaded, and database records saved (`Links Backed Up to Database: N`).
 
 *Note: Requires `Manage Messages` or `Administrator` permission.*
 
@@ -254,6 +256,11 @@ If a Discord channel is accidentally deleted, wiped, or you are migrating links:
 - **Author Attribution (`attribution: true`)**: Attaches `(originally shared by @User on YYYY-MM-DD)` alongside original message commentary.
 - **Rate-Limit Safe**: Automatically paces reposting (`RESTORE_PACE_DELAY_MS=1500`) to strictly avoid Discord API rate limits.
 - **Cancel Anytime**: Full support for `/stop` or `!stop` to halt an active restoration task.
+
+### 3. Dedicated Backup Channels (Zero-Intrusion Mode)
+You can track and backup links in specific channels without having the bot download or repost media attachments:
+- Specify channels in `LINK_BACKUP_CHANNELS` without adding them to `ALLOWED_CHANNEL_IDS`.
+- Archivist Fox will silently index every link and original user message commentary into SQLite for backup and disaster recovery, while leaving chat completely untouched (no media downloads, no uploads, and no duplicate alerts).
 
 ## Running Tests
 
