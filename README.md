@@ -227,7 +227,7 @@ To download high-resolution Pixiv illustrations and multi-image manga works with
 1. Double-click `pixiv_login.bat` (or run `npm run pixiv-login`).
 2. Follow the prompt in your browser to log into Pixiv, right-click the login button, copy the callback URL, and paste it back into the terminal.
 3. The script automatically writes `PIXIV_REFRESH_TOKEN` to `.env` and configures gallery-dl.
-4. For detailed step-by-step instructions, see [`PIXIV_LOGIN_GUIDE.txt`](PIXIV_LOGIN_GUIDE.txt).
+4. For detailed step-by-step instructions, see `PIXIV_LOGIN_GUIDE.txt`.
 
 ## Link Backup & Disaster Recovery (`/export-links` & `/restore`)
 

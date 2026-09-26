@@ -9,8 +9,9 @@ import {
   AttachmentBuilder,
   PermissionFlagsBits,
   ChannelType,
+  MessageFlags,
 } from 'discord.js';
-import { config, isChannelAllowed } from './config.js';
+import { config, isChannelAllowed, isLinkBackupChannel } from './config.js';
 import { getDb, getDistinctLinkChannels } from './linkDb.js';
 import { getBestVideoEncoder } from './compress.js';
 import { handleMessage } from './mediaHandler.js';
@@ -363,7 +364,7 @@ export async function handleInteraction(interaction) {
         } else {
           await interaction.reply({
             content: '❌ Only the person who posted the link or a moderator can dismiss this notice.',
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         return;
@@ -380,7 +381,7 @@ export async function handleInteraction(interaction) {
         if (!isAuthor && !isMod) {
           await interaction.reply({
             content: '❌ Only the person who posted the link or a moderator can delete this post.',
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
           return;
         }
@@ -392,7 +393,7 @@ export async function handleInteraction(interaction) {
           if (botPermissions && !botPermissions.has(PermissionFlagsBits.ManageMessages)) {
             await interaction.reply({
               content: '❌ I do not have permission to delete posts in this channel. Please grant Archivist Fox the **Manage Messages** permission.',
-              ephemeral: true,
+              flags: MessageFlags.Ephemeral,
             });
             return;
           }
@@ -428,12 +429,12 @@ export async function handleInteraction(interaction) {
         if (!isChannelAllowed(targetMessage.channelId)) {
           await interaction.reply({
             content: '❌ Archivist Fox is not enabled in that channel.',
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
           return;
         }
 
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         try {
           const result = await handleMessage(targetMessage, { notifyIfEmpty: true, force: true });
@@ -652,7 +653,7 @@ export async function handleInteraction(interaction) {
         if (!isMod) {
           await interaction.reply({
             content: '❌ You need the `Manage Messages` or `Administrator` permission to run a channel rescan.',
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
           return;
         }
@@ -660,7 +661,7 @@ export async function handleInteraction(interaction) {
         if (isScanRunning()) {
           await interaction.reply({
             content: '⚠️ A rescan or media crawl is already running. Please wait for it to complete.',
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
           return;
         }
@@ -671,11 +672,11 @@ export async function handleInteraction(interaction) {
         const force = interaction.options.getBoolean('force') || false;
         const concurrency = interaction.options.getInteger('concurrency') || undefined;
 
-        // Enforce channel-gating: respect ALLOWED_CHANNEL_IDS / DISALLOWED_CHANNEL_IDS.
-        if (!isChannelAllowed(channel.id)) {
+        // Enforce channel-gating: allow if either media archiving or link backup is enabled for this channel.
+        if (!isChannelAllowed(channel.id) && !isLinkBackupChannel(channel)) {
           await interaction.reply({
-            content: `❌ Archivist Fox is not enabled in ${channel}. Check your \`ALLOWED_CHANNEL_IDS\` / \`DISALLOWED_CHANNEL_IDS\` configuration.`,
-            ephemeral: true,
+            content: `❌ Archivist Fox is not enabled in ${channel}. Check your \`ALLOWED_CHANNEL_IDS\` / \`DISALLOWED_CHANNEL_IDS\` or \`LINK_BACKUP_CHANNELS\` configuration.`,
+            flags: MessageFlags.Ephemeral,
           });
           return;
         }
@@ -684,8 +685,10 @@ export async function handleInteraction(interaction) {
         setScanRunning(true);
 
         try {
+          const isBackupOnly = !isChannelAllowed(channel.id) && isLinkBackupChannel(channel);
+          const scanModeLabel = isBackupOnly ? 'link backup scan' : 'media scan';
           const progressNotice = await interaction.editReply({
-            content: `⏳ Starting media scan of ${channel} (limit: ${limit === Infinity ? 'all' : limit} messages)...`,
+            content: `⏳ Starting ${scanModeLabel} of ${channel} (limit: ${limit === Infinity ? 'all' : limit} messages)...`,
           });
 
           let lastEditTime = Date.now();
@@ -693,9 +696,10 @@ export async function handleInteraction(interaction) {
             const now = Date.now();
             if (now - lastEditTime > 4000) {
               lastEditTime = now;
+              const backupPart = progress.linksBackedUp ? ` | Links backed up: **${progress.linksBackedUp}**` : '';
               await interaction
                 .editReply({
-                  content: `⏳ Scanning ${channel}...\nMessages scanned: **${progress.messagesScanned}** | Media links: **${progress.mediaLinksFound}** | Archived: **${progress.archivedCount}**`,
+                  content: `⏳ Scanning ${channel}...\nMessages scanned: **${progress.messagesScanned}** | Media links: **${progress.mediaLinksFound}**${backupPart} | Archived: **${progress.archivedCount}**`,
                 })
                 .catch(() => {});
             }
@@ -714,9 +718,10 @@ export async function handleInteraction(interaction) {
           );
 
           const wasStopped = isStopRequested();
+          const backupSummaryLine = stats.linksBackedUp ? `\n• Links backed up to database: **${stats.linksBackedUp}**` : '';
           const summaryText = wasStopped
-            ? `🛑 Scan stopped early for ${channel}!\n• Messages checked: **${stats.messagesScanned}**\n• Media links found: **${stats.mediaLinksFound}**\n• New items archived: **${stats.archivedCount}**\n• Missing reposted: **${stats.repostedMissingCount}**\n• Skipped: **${stats.skippedCount}**`
-            : `✅ Scan complete for ${channel}!\n• Messages checked: **${stats.messagesScanned}**\n• Media links found: **${stats.mediaLinksFound}**\n• New items archived: **${stats.archivedCount}**\n• Missing reposted: **${stats.repostedMissingCount}**\n• Skipped/duplicates: **${stats.skippedCount}**`;
+            ? `🛑 Scan stopped early for ${channel}!\n• Messages checked: **${stats.messagesScanned}**\n• Media links found: **${stats.mediaLinksFound}**${backupSummaryLine}\n• New items archived: **${stats.archivedCount}**\n• Missing reposted: **${stats.repostedMissingCount}**\n• Skipped: **${stats.skippedCount}**`
+            : `✅ Scan complete for ${channel}!\n• Messages checked: **${stats.messagesScanned}**\n• Media links found: **${stats.mediaLinksFound}**${backupSummaryLine}\n• New items archived: **${stats.archivedCount}**\n• Missing reposted: **${stats.repostedMissingCount}**\n• Skipped/duplicates: **${stats.skippedCount}**`;
 
           try {
             await interaction.editReply({ content: summaryText });
@@ -749,7 +754,7 @@ export async function handleInteraction(interaction) {
         if (!isMod) {
           await interaction.reply({
             content: '❌ You need the `Manage Messages` or `Administrator` permission to export link backups.',
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
           return;
         }
@@ -830,7 +835,7 @@ export async function handleInteraction(interaction) {
         if (!interaction.guild) {
           await interaction.reply({
             content: '❌ Link restoration can only be used inside a server, not in DMs.',
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
           return;
         }
@@ -842,7 +847,7 @@ export async function handleInteraction(interaction) {
         if (!isAdmin) {
           await interaction.reply({
             content: '❌ You need the `Administrator` permission to restore and repost links.',
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
           return;
         }
@@ -850,7 +855,7 @@ export async function handleInteraction(interaction) {
         if (isRestoreRunning()) {
           await interaction.reply({
             content: '⚠️ A link restoration task is already in progress. Please wait for it or use `/stop` to cancel.',
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
           return;
         }
@@ -941,7 +946,7 @@ export async function handleInteraction(interaction) {
         if (!isMod) {
           await interaction.reply({
             content: '❌ You need the `Manage Messages` or `Administrator` permission to stop running tasks.',
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
           return;
         }
@@ -957,7 +962,7 @@ export async function handleInteraction(interaction) {
         } else {
           await interaction.reply({
             content: 'ℹ️ No active rescan, playlist download, restoration, or queued tasks are currently running.',
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         return;

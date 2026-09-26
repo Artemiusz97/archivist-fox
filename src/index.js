@@ -1,5 +1,5 @@
 import { Client, Events, GatewayIntentBits, Partials, PermissionFlagsBits } from 'discord.js';
-import { config, isChannelAllowed, requireDiscordToken } from './config.js';
+import { config, isChannelAllowed, isLinkBackupChannel, requireDiscordToken } from './config.js';
 import { handleMessage } from './mediaHandler.js';
 import { processMessageLinks } from './linkDetector.js';
 import { initLinkDb, pruneExpiredLinks, closeLinkDb, checkpointWal, getDistinctLinkChannels } from './linkDb.js';
@@ -139,7 +139,10 @@ async function handleRetryCommand(commandMessage, isForce = false, cmd = '!retry
 
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
-  if (!isChannelAllowed(message.channelId)) return;
+
+  const mediaAllowed = isChannelAllowed(message.channelId);
+  const backupAllowed = isLinkBackupChannel(message.channel);
+  if (!mediaAllowed && !backupAllowed) return;
 
   try {
     if (message.content.trim().toLowerCase() === '!help') {
@@ -282,10 +285,12 @@ client.on('messageCreate', async (message) => {
     // 1. General Duplicate Link Detector (runs across all links in the message)
     const linkResult = await processMessageLinks(message);
 
-    // 2. Media Handler (downloads and uploads attachments if media links are present)
-    await handleMessage(message, {
-      duplicateUrls: linkResult.duplicateUrls,
-    });
+    // 2. Media Handler (downloads and uploads attachments if media links are present and media downloading is allowed)
+    if (mediaAllowed) {
+      await handleMessage(message, {
+        duplicateUrls: linkResult.duplicateUrls,
+      });
+    }
   } catch (err) {
     console.error(`Failed to handle message ${message.id}:`, err);
   }

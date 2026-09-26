@@ -112,7 +112,7 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 - **Pixiv OAuth Authorization Helper & Guide (`scripts/pixiv_auth.py`, `pixiv_login.bat`, `PIXIV_LOGIN_GUIDE.txt`, `src/galleryDlConfig.js`, `src/config.js`)**:
   - Added PKCE authentication script (`scripts/pixiv_auth.py`) and Windows shortcut (`pixiv_login.bat` / `npm run pixiv-login`).
   - Generates auth URL, exchanges callback code, and writes `PIXIV_REFRESH_TOKEN` to `.env` and gallery-dl config.
-  - Added comprehensive beginner's guide [`PIXIV_LOGIN_GUIDE.txt`](PIXIV_LOGIN_GUIDE.txt).
+  - Added comprehensive beginner's guide `PIXIV_LOGIN_GUIDE.txt`.
 - **Channel Crawl Subtitle Archival & Playlist Stability (`src/scanner.js`, `src/playlistHandler.js`)**:
   - Preserves subtitle tracks during historical channel crawls (`crawlChannel`).
   - Playlist processing properly resets stop state flags (`clearStopRequested()`) and handles download errors gracefully.

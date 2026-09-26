@@ -1,4 +1,4 @@
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, ChannelType } from 'discord.js';
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, ChannelType, MessageFlags } from 'discord.js';
 import { config } from './config.js';
 import { fetchFlatPlaylistInfo } from './ytdlpDownloader.js';
 import { handleMessage } from './mediaHandler.js';
@@ -80,7 +80,7 @@ export async function handlePlaylistPromptAndDownload(message, rawUrl, details, 
         const isAuthor = i.user.id === message.author.id;
         const isMod = i.memberPermissions?.has(8n) || i.memberPermissions?.has(8192n); // Admin or Manage Messages
         if (isAuthor || isMod) return true;
-        i.reply({ content: '❌ Only the person who posted this link or a moderator can make this choice.', ephemeral: true }).catch(() => {});
+        i.reply({ content: '❌ Only the person who posted this link or a moderator can make this choice.', flags: MessageFlags.Ephemeral }).catch(() => {});
         return false;
       },
       componentType: ComponentType.Button,

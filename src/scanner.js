@@ -279,6 +279,7 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
     channelName: channel.name || channel.id,
     messagesScanned: 0,
     mediaLinksFound: 0,
+    linksBackedUp: 0,
     archivedCount: 0,
     repostedMissingCount: 0,
     skippedCount: 0,
@@ -317,8 +318,8 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
       const message = workQueue.shift();
       if (message.author.bot) continue;
 
-      // 1. General duplicate link detector
-      if (config.enableGeneralDuplicateDetector) {
+      // 1. General duplicate link detector & Link Backup indexing
+      if (config.enableGeneralDuplicateDetector || isLinkBackupChannel(channel)) {
         const allUrls = await extractAllUrlsAsync(message.content);
         for (const { originalUrl, normalizedUrl } of allUrls) {
           const { isDuplicate } = findDuplicateLink(normalizedUrl, {
@@ -340,9 +341,19 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
                 postedAt: message.createdTimestamp || Date.now(),
                 content: message.content || null,
               });
+              stats.linksBackedUp++;
             }
           }
         }
+      }
+
+      // If this channel is disallowed for media downloading (e.g. a link-backup-only channel),
+      // skip downloading and uploading media files.
+      if (!isChannelAllowed(channel.id)) {
+        if (onProgress) {
+          onProgress(stats).catch(() => {});
+        }
+        continue;
       }
 
       const links = await extractMediaLinksAsync(message.content);
@@ -734,9 +745,10 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
     ? (stats.totalBytesArchived / (totalElapsed / 1000) / (1024 * 1024)).toFixed(1)
     : '0';
 
+  const backupSummary = stats.linksBackedUp > 0 ? `, ${stats.linksBackedUp} links backed up` : '';
   console.log(
     `[Scanner] ✅ Finished #${channel.name} in ${formatDuration(totalElapsed)}: ` +
-    `${stats.archivedCount} archived (${formatBytes(stats.totalBytesArchived)}), ` +
+    `${stats.archivedCount} archived (${formatBytes(stats.totalBytesArchived)})${backupSummary}, ` +
     `${stats.skippedCount} skipped, ${stats.failedCount} failed | Avg Speed: ${avgSpeed} MB/s`
   );
 
@@ -799,13 +811,21 @@ export async function handleRescanCommand(commandMessage) {
         c.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.ReadMessageHistory)
     );
 
-    // Apply allowed/disallowed channel filtering if configured
+    // Apply allowed/disallowed channel filtering while ensuring link backup channels are preserved
     if (config.allowedChannelIds.length > 0) {
-      targetChannels = targetChannels.filter((c) => config.allowedChannelIds.includes(c.id));
+      targetChannels = targetChannels.filter((c) => config.allowedChannelIds.includes(c.id) || isLinkBackupChannel(c));
     } else if (config.disallowedChannelIds.length > 0) {
-      targetChannels = targetChannels.filter((c) => !config.disallowedChannelIds.includes(c.id));
+      targetChannels = targetChannels.filter((c) => !config.disallowedChannelIds.includes(c.id) || isLinkBackupChannel(c));
     }
   } else if (target === 'current') {
+    if (!isChannelAllowed(commandMessage.channel.id) && !isLinkBackupChannel(commandMessage.channel)) {
+      const notice = await commandMessage.reply({
+        content: `❌ Archivist Fox is not enabled in ${commandMessage.channel}. Check your \`ALLOWED_CHANNEL_IDS\` / \`DISALLOWED_CHANNEL_IDS\` or \`LINK_BACKUP_CHANNELS\` configuration.`,
+        allowedMentions: { repliedUser: false },
+      });
+      scheduleAutoDelete(notice);
+      return;
+    }
     targetChannels = [commandMessage.channel];
   } else {
     let specificChannel = null;
@@ -826,6 +846,14 @@ export async function handleRescanCommand(commandMessage) {
     }
 
     if (specificChannel && specificChannel.viewable && specificChannel.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.ReadMessageHistory)) {
+      if (!isChannelAllowed(specificChannel.id) && !isLinkBackupChannel(specificChannel)) {
+        const notice = await commandMessage.reply({
+          content: `❌ Archivist Fox is not enabled in ${specificChannel}. Check your \`ALLOWED_CHANNEL_IDS\` / \`DISALLOWED_CHANNEL_IDS\` or \`LINK_BACKUP_CHANNELS\` configuration.`,
+          allowedMentions: { repliedUser: false },
+        });
+        scheduleAutoDelete(notice);
+        return;
+      }
       targetChannels = [specificChannel];
     } else {
       const notice = await commandMessage.reply({
@@ -863,6 +891,7 @@ export async function handleRescanCommand(commandMessage) {
     channelsCount: targetChannels.length,
     messagesScanned: 0,
     mediaLinksFound: 0,
+    linksBackedUp: 0,
     archivedCount: 0,
     repostedMissingCount: 0,
     skippedCount: 0,
@@ -892,6 +921,7 @@ export async function handleRescanCommand(commandMessage) {
           const totalArchived = aggregate.archivedCount + currentChannelStats.archivedCount;
           const totalReposted = aggregate.repostedMissingCount + currentChannelStats.repostedMissingCount;
           const totalStorage = formatBytes(aggregate.totalBytes + currentChannelStats.totalBytesArchived);
+          const totalBackedUp = aggregate.linksBackedUp + (currentChannelStats.linksBackedUp || 0);
 
           let statusContent =
             `⏳ **${modeName} in Progress...**\n` +
@@ -899,6 +929,7 @@ export async function handleRescanCommand(commandMessage) {
             `📍 Current Channel: **#${ch.name}**${channelIndexStr}\n` +
             `📨 Messages Scanned: **${totalMsgs.toLocaleString()}**\n` +
             `🎬 Media Links Found: **${totalLinks.toLocaleString()}**\n` +
+            (totalBackedUp > 0 ? `🔗 Links Backed Up: **${totalBackedUp.toLocaleString()}**\n` : '') +
             `💾 Archived to PC: **${totalArchived} files** (${totalStorage})\n`;
 
           if (repostMissing || upload) {
@@ -913,6 +944,7 @@ export async function handleRescanCommand(commandMessage) {
       // Accumulate channel stats
       aggregate.messagesScanned += chStats.messagesScanned;
       aggregate.mediaLinksFound += chStats.mediaLinksFound;
+      aggregate.linksBackedUp += (chStats.linksBackedUp || 0);
       aggregate.archivedCount += chStats.archivedCount;
       aggregate.repostedMissingCount += chStats.repostedMissingCount;
       aggregate.skippedCount += chStats.skippedCount;
@@ -933,6 +965,7 @@ export async function handleRescanCommand(commandMessage) {
       `📁 Channels Scanned: **${aggregate.channelsCount}**\n` +
       `📨 Total Messages Scanned: **${aggregate.messagesScanned.toLocaleString()}**\n` +
       `🎬 Total Media Links Found: **${aggregate.mediaLinksFound.toLocaleString()}**\n` +
+      (aggregate.linksBackedUp > 0 ? `🔗 Links Backed Up to Database: **${aggregate.linksBackedUp.toLocaleString()}**\n` : '') +
       `💾 High-Quality Files Archived: **${aggregate.archivedCount} files**\n`;
 
     if (aggregate.repostedMissingCount > 0 || repostMissing || upload) {
