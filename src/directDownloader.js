@@ -34,7 +34,12 @@ function inferExtensionFromContentType(contentType) {
  * Aborts early if the server reports a content-length larger than maxBytes.
  * Returns the path of the downloaded file.
  */
-export async function downloadDirect(url, destDir, maxBytes) {
+export async function downloadDirect(url, destDir, maxBytes, options = {}) {
+  const signal = options?.signal;
+  if (signal?.aborted) {
+    throw new Error('DOWNLOAD_ABORTED');
+  }
+
   let rawBase = `file-${Date.now()}`;
   try {
     const parsed = new URL(url);
@@ -51,6 +56,7 @@ export async function downloadDirect(url, destDir, maxBytes) {
     responseType: 'stream',
     timeout: 60000,
     maxRedirects: 5,
+    signal,
     headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ArchivistFox/1.0)' },
     validateStatus: (status) => status >= 200 && status < 300,
   });
@@ -79,9 +85,14 @@ export async function downloadDirect(url, destDir, maxBytes) {
     // a secondary 'error' event on an already-settled Promise (common on Windows
     // where stream teardown can race with file handle release).
     let settled = false;
+    let onAbort = null;
+
     const settle = (fn, val) => {
       if (settled) return;
       settled = true;
+      if (signal && onAbort) {
+        signal.removeEventListener('abort', onAbort);
+      }
       fn(val);
     };
 
@@ -95,6 +106,15 @@ export async function downloadDirect(url, destDir, maxBytes) {
       fs.promises.unlink(destPath).catch(() => {});
       settle(reject, err);
     };
+
+    if (signal) {
+      onAbort = () => abort(new Error('DOWNLOAD_ABORTED'));
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
 
     response.data.on('data', (chunk) => {
       downloaded += chunk.length;

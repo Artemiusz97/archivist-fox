@@ -1,10 +1,12 @@
 import { config } from './config.js';
+import { isAbortError } from './utils.js';
 
-class DownloadQueue {
+export class DownloadQueue {
   constructor(concurrency = 2, maxDepth = 50) {
     this.concurrency = concurrency;
     this.running = 0;
     this.queue = [];
+    this.activeTasks = new Set();
     // Maximum number of tasks that may wait in the queue at once.
     // Tasks beyond this limit are rejected gracefully to protect against memory
     // exhaustion from link floods or rapid bulk posting.
@@ -15,7 +17,7 @@ class DownloadQueue {
    * Enqueues a message for media processing with live Method 3 status indicators.
    *
    * @param {import('discord.js').Message} message
-   * @param {(statusHook: { onStatus: (status: 'downloading'|'compressing'|'done') => Promise<void> }) => Promise<any>} taskFn
+   * @param {(statusHook: { onStatus: (status: 'downloading'|'compressing'|'done') => Promise<void>, signal: AbortSignal }) => Promise<any>} taskFn
    * @returns {Promise<any>}
    */
   async add(message, taskFn) {
@@ -63,13 +65,60 @@ class DownloadQueue {
     const count = this.queue.length;
     for (const item of this.queue) {
       if (item.queuedReaction) {
-        const botUserId = item.message.client?.user?.id;
-        item.message.reactions?.resolve(item.queuedReaction)?.users?.remove(botUserId).catch(() => {});
+        try {
+          const botUserId = item.message.client?.user?.id;
+          if (item.queuedReaction.users) {
+            item.queuedReaction.users.remove(botUserId).catch(() => {});
+          } else if (typeof item.message.reactions?.resolve === 'function') {
+            item.message.reactions.resolve(item.queuedReaction)?.users?.remove(botUserId).catch(() => {});
+          }
+        } catch {}
       }
       item.resolve({ found: 0, uploaded: 0, failed: 0, stopped: true });
     }
     this.queue = [];
     return count;
+  }
+
+  /**
+   * Aborts all downloads currently in progress and clears all pending queued tasks.
+   *
+   * @returns {{ activeStopped: number, queueCleared: number }}
+   */
+  stopAll() {
+    const activeCount = this.activeTasks.size;
+    for (const active of this.activeTasks) {
+      try {
+        active.abortController.abort();
+      } catch {}
+      // Remove reactions eagerly for immediate UI responsiveness
+      active.cleanupReactions().catch(() => {});
+    }
+
+    const queueCleared = this.clear();
+
+    return {
+      activeStopped: activeCount,
+      queueCleared,
+    };
+  }
+
+  /**
+   * Returns the count of downloads currently running in progress.
+   *
+   * @returns {number}
+   */
+  getActiveCount() {
+    return this.activeTasks.size;
+  }
+
+  /**
+   * Returns the count of tasks waiting in the queue.
+   *
+   * @returns {number}
+   */
+  getDepth() {
+    return this.queue.length;
   }
 
   async processNext() {
@@ -123,8 +172,17 @@ class DownloadQueue {
       }
     };
 
+    const abortController = new AbortController();
+    const activeTask = {
+      message,
+      abortController,
+      cleanupReactions,
+    };
+    this.activeTasks.add(activeTask);
+
     const onStatus = async (status) => {
       try {
+        if (abortController.signal.aborted) return;
         if (status === 'downloading') {
           if (queuedReaction) {
             await removeBotReaction(queuedReaction);
@@ -162,11 +220,16 @@ class DownloadQueue {
       }, 8000);
       typingInterval.unref?.();
 
-      const result = await taskFn({ onStatus });
+      const result = await taskFn({ onStatus, signal: abortController.signal });
       resolve(result);
     } catch (err) {
-      reject(err);
+      if (isAbortError(err) || abortController.signal.aborted) {
+        resolve({ found: 0, uploaded: 0, failed: 0, stopped: true });
+      } else {
+        reject(err);
+      }
     } finally {
+      this.activeTasks.delete(activeTask);
       await cleanupReactions();
       this.running--;
       this.processNext();

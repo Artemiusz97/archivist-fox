@@ -3,6 +3,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { config } from './config.js';
 import { run, getBestVideoEncoder } from './compress.js';
+import { isAbortError } from './utils.js';
 
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'webm', 'mkv', 'm4v']);
 
@@ -64,7 +65,7 @@ export async function findThumbnailFile(videoPath, destDir) {
  * @param {string} [providedThumbPath] - Optional pre-discovered thumbnail path
  * @returns {Promise<string>} - The resulting video path
  */
-export async function applyThumbnailPreview(videoPath, destDir, providedThumbPath = null) {
+export async function applyThumbnailPreview(videoPath, destDir, providedThumbPath = null, options = {}) {
   if (!config.prependThumbnailPreview) return videoPath;
   if (!isVideo(videoPath)) return videoPath;
 
@@ -84,7 +85,7 @@ export async function applyThumbnailPreview(videoPath, destDir, providedThumbPat
 
   try {
     // 2. Probe video dimensions
-    const dimensions = await getVideoDimensions(videoPath);
+    const dimensions = await getVideoDimensions(videoPath, options.signal);
     if (!dimensions || !dimensions.width || !dimensions.height) {
       return videoPath;
     }
@@ -94,12 +95,12 @@ export async function applyThumbnailPreview(videoPath, destDir, providedThumbPat
     const height = dimensions.height % 2 === 0 ? dimensions.height : dimensions.height - 1;
 
     const primaryEncoder = await getBestVideoEncoder();
-    let success = await tryInject(primaryEncoder, videoPath, thumbPath, width, height, tempOutput);
+    let success = await tryInject(primaryEncoder, videoPath, thumbPath, width, height, tempOutput, options.signal);
 
     // Fall back to CPU libx264 if GPU encoder failed
     if (!success && primaryEncoder !== 'libx264') {
       console.warn(`[ThumbnailPreview] ${primaryEncoder} failed, falling back to libx264...`);
-      success = await tryInject('libx264', videoPath, thumbPath, width, height, tempOutput);
+      success = await tryInject('libx264', videoPath, thumbPath, width, height, tempOutput, options.signal);
     }
 
     if (success && fs.existsSync(tempOutput)) {
@@ -110,8 +111,9 @@ export async function applyThumbnailPreview(videoPath, destDir, providedThumbPat
       await fs.promises.unlink(tempOutput).catch(() => {});
     }
   } catch (err) {
-    console.warn(`[ThumbnailPreview] Failed to inject thumbnail preview for ${parsed.base}:`, err.message);
     await fs.promises.unlink(tempOutput).catch(() => {});
+    if (isAbortError(err) || options.signal?.aborted) throw err;
+    console.warn(`[ThumbnailPreview] Failed to inject thumbnail preview for ${parsed.base}:`, err.message);
   } finally {
     // Clean up temporary extracted thumbnail image
     if (isTempExtracted) {
@@ -122,7 +124,7 @@ export async function applyThumbnailPreview(videoPath, destDir, providedThumbPat
   return videoPath;
 }
 
-async function tryInject(encoder, videoPath, thumbPath, width, height, tempOutput) {
+async function tryInject(encoder, videoPath, thumbPath, width, height, tempOutput, signal = null) {
   const encoderArgs = getEncoderArgs(encoder);
   const filter = `[1:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1[t];[0:v][t]overlay=enable='between(t,0,0.15)'[v]`;
 
@@ -142,15 +144,16 @@ async function tryInject(encoder, videoPath, thumbPath, width, height, tempOutpu
   ];
 
   try {
-    await run(config.ffmpegPath, args);
+    await run(config.ffmpegPath, args, 4 * 60 * 1000, signal);
     return fs.existsSync(tempOutput);
-  } catch {
+  } catch (err) {
     await fs.promises.unlink(tempOutput).catch(() => {});
+    if (isAbortError(err) || signal?.aborted) throw err;
     return false;
   }
 }
 
-export async function getVideoDimensions(videoPath) {
+export async function getVideoDimensions(videoPath, signal = null) {
   try {
     const { stdout } = await run(config.ffprobePath, [
       '-v', 'error',
@@ -158,7 +161,7 @@ export async function getVideoDimensions(videoPath) {
       '-show_entries', 'stream=width,height',
       '-of', 'csv=s=x:p=0',
       videoPath,
-    ]);
+    ], 60 * 1000, signal);
     const parts = stdout.trim().split('x');
     if (parts.length >= 2) {
       const width = parseInt(parts[0], 10);
@@ -167,7 +170,9 @@ export async function getVideoDimensions(videoPath) {
         return { width, height };
       }
     }
-  } catch {}
+  } catch (err) {
+    if (isAbortError(err) || signal?.aborted) throw err;
+  }
   return null;
 }
 

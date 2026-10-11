@@ -13,13 +13,16 @@ import { saveRecord, findDuplicateByUrl, findDuplicate } from './db.js';
 import { saveLinkRecord, findDuplicateLink } from './linkDb.js';
 import { ensureWithinLimit, isValidDisplayTitle } from './mediaHandler.js';
 import { applyThumbnailPreview } from './thumbnailPreview.js';
+import { processDualFormatMedia } from './gifHandler.js';
 import { downloadQueue } from './queue.js';
 import { isPlaylistDownloading } from './playlistHandler.js';
 import { isRestoreRunning, requestRestoreStop } from './linkRestorer.js';
-import { scheduleAutoDelete } from './utils.js';
+import { scheduleAutoDelete, killAllDownloadProcesses, isAbortError, sleep } from './utils.js';
 
 let isScanningActive = false;
 let isScanStopRequested = false;
+let scanAbortController = null;
+let activeScanDownloads = 0;
 
 export function isScanRunning() {
   return isScanningActive;
@@ -41,6 +44,11 @@ export function clearStopRequested() {
 export function requestScanStop() {
   if (isScanningActive) {
     isScanStopRequested = true;
+    if (scanAbortController) {
+      try {
+        scanAbortController.abort();
+      } catch {}
+    }
     return true;
   }
   return false;
@@ -51,9 +59,17 @@ export function stopActiveTasks() {
   const playlistRunning = isPlaylistDownloading();
   const restoreRunning = isRestoreRunning();
   isScanStopRequested = true;
+  if (scanAbortController) {
+    try {
+      scanAbortController.abort();
+    } catch {}
+  }
   requestRestoreStop();
-  const queueItemsCleared = downloadQueue.clear();
-  return { scanRunning, playlistRunning, restoreRunning, queueItemsCleared };
+  const { activeStopped, queueCleared } = downloadQueue.stopAll();
+  const killedProcCount = killAllDownloadProcesses();
+  const activeDownloadsStopped = Math.max(activeStopped, killedProcCount, activeScanDownloads);
+  const queueItemsCleared = queueCleared;
+  return { scanRunning, playlistRunning, restoreRunning, queueItemsCleared, activeDownloadsStopped };
 }
 
 /**
@@ -127,21 +143,27 @@ export function parseRescanArgs(content, currentChannel) {
  * Downloads a platform or direct media link with automatic retries for transient errors.
  * DeviantArt has no yt-dlp extractor and is routed directly to gallery-dl.
  */
-async function downloadMedia(link, destDir, maxRetries = 2) {
+async function downloadMedia(link, destDir, maxRetries = 2, signal = null) {
   let lastErr = null;
 
   for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    if (signal?.aborted) {
+      throw new Error('DOWNLOAD_ABORTED');
+    }
     try {
       if (link.type === 'direct') {
-        const filePath = await downloadDirect(link.url, destDir, config.hardCapBytes);
+        const filePath = await downloadDirect(link.url, destDir, config.hardCapBytes, { signal });
         return [filePath];
       }
 
       // DeviantArt fast-path: yt-dlp has no DeviantArt extractor, go straight to gallery-dl.
       if (isDeviantArtUrl(link.url)) {
         try {
-          return await downloadWithGalleryDl(link.url, destDir);
+          return await downloadWithGalleryDl(link.url, destDir, { signal });
         } catch (err) {
+          if (isAbortError(err) || signal?.aborted) {
+            throw err;
+          }
           lastErr = err;
           const isTransient =
             err?.message?.includes('TIMEOUT') ||
@@ -150,27 +172,33 @@ async function downloadMedia(link, destDir, maxRetries = 2) {
             err?.message?.includes('ECONNRESET') ||
             err?.message?.includes('ETIMEDOUT');
 
-          if (isTransient && attempt <= maxRetries) {
-            console.warn(
-              `[Scanner] DeviantArt download of <${link.url}> hit transient error (${err.message}), retrying attempt ${attempt + 1}/${maxRetries + 1}...`
-            );
-            await new Promise((r) => setTimeout(r, attempt * 3000));
-            continue;
-          }
-          throw err;
+        if (isTransient && attempt <= maxRetries) {
+          console.warn(
+            `[Scanner] DeviantArt download of <${link.url}> hit transient error (${err.message}), retrying attempt ${attempt + 1}/${maxRetries + 1}...`
+          );
+          await sleep(attempt * 3000, signal);
+          continue;
         }
+        throw err;
       }
+    }
 
       try {
-        return await downloadWithYtDlp(link.url, destDir);
+        return await downloadWithYtDlp(link.url, destDir, { signal });
       } catch (ytErr) {
+        if (isAbortError(ytErr) || signal?.aborted) {
+          throw ytErr;
+        }
         const msg = ytErr?.message || '';
         if (msg.startsWith('COMMAND_NOT_FOUND')) {
           throw ytErr;
         }
         try {
-          return await downloadWithGalleryDl(link.url, destDir);
+          return await downloadWithGalleryDl(link.url, destDir, { signal });
         } catch (galleryErr) {
+          if (isAbortError(galleryErr) || signal?.aborted) {
+            throw galleryErr;
+          }
           if (galleryErr?.message?.includes('Unsupported URL')) {
             lastErr = ytErr;
           } else {
@@ -188,15 +216,18 @@ async function downloadMedia(link, destDir, maxRetries = 2) {
             console.warn(
               `[Scanner] Download of <${link.url}> hit rate-limit/timeout (${lastErr.message}), retrying attempt ${attempt + 1}/${maxRetries + 1}...`
             );
-            await new Promise((r) => setTimeout(r, attempt * 3000));
+            await sleep(attempt * 3000, signal);
             continue;
           }
         }
       }
     } catch (err) {
+      if (isAbortError(err) || signal?.aborted) {
+        throw err;
+      }
       lastErr = err;
       if (attempt <= maxRetries) {
-        await new Promise((r) => setTimeout(r, attempt * 3000));
+        await sleep(attempt * 3000, signal);
         continue;
       }
     }
@@ -299,6 +330,7 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
   const inFlightUrls = new Set(); // Prevents parallel workers from downloading the exact same link
   const speedTracker = new CrawlSpeedTracker();
 
+  scanAbortController = new AbortController();
   console.log(`[Scanner] 🚀 Crawl started for #${channel.name} (Concurrency: ${concurrency} workers)`);
 
   // Worker Loop
@@ -437,7 +469,31 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
             inFlightUrls.add(normalized);
           }
 
-          console.log(`[Scanner] [W${workerId}] 📥 Downloading: ${truncateUrl(link.url)}`);
+          const channelName = channel.name || 'chat';
+          let localArchiveCandidate = null;
+          if (normalized) {
+            const existing = await findDuplicateByUrl(link.url);
+            if (existing?.fileName) {
+              const rootDir = path.resolve(config.archiveDirectory);
+              const candidates = [
+                path.join(rootDir, existing.channel || '', existing.fileName),
+                path.join(rootDir, channelName, existing.fileName),
+                path.join(rootDir, existing.fileName),
+              ];
+              for (const cp of candidates) {
+                if (fs.existsSync(cp)) {
+                  localArchiveCandidate = cp;
+                  break;
+                }
+              }
+            }
+          }
+
+          if (localArchiveCandidate) {
+            console.log(`[Scanner] [W${workerId}] 📂 Reusing local archive copy for: ${truncateUrl(link.url)}`);
+          } else {
+            console.log(`[Scanner] [W${workerId}] 📥 Downloading: ${truncateUrl(link.url)}`);
+          }
 
           const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'archivist-scan-'));
           tempDirsToCleanup.push(tempDir);
@@ -445,31 +501,40 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
           try {
             let filePaths = [];
             let subtitleFiles = [];
-            try {
-              const dlResult = await downloadMedia(link, tempDir);
-              filePaths = Array.isArray(dlResult) ? dlResult : (dlResult?.mediaFiles || []);
-              subtitleFiles = Array.isArray(dlResult) ? [] : (dlResult?.subtitleFiles || []);
-            } catch (dlErr) {
-              // Fallback: check if media is already preserved in local archive
-              const existing = normalized ? await findDuplicateByUrl(link.url) : null;
-              if (existing?.fileName) {
-                const candidateArchive = path.join(
-                  path.resolve(config.archiveDirectory),
-                  existing.channel || '',
-                  existing.fileName
-                );
-                if (fs.existsSync(candidateArchive)) {
-                  filePaths = [candidateArchive];
-                  console.log(`[Scanner] [W${workerId}] 📂 Reusing local archive copy for: ${truncateUrl(link.url)}`);
+            if (localArchiveCandidate) {
+              filePaths = [localArchiveCandidate];
+            } else {
+              try {
+                activeScanDownloads++;
+                const dlResult = await downloadMedia(link, tempDir, 2, scanAbortController?.signal);
+                filePaths = Array.isArray(dlResult) ? dlResult : (dlResult?.mediaFiles || []);
+                subtitleFiles = Array.isArray(dlResult) ? [] : (dlResult?.subtitleFiles || []);
+              } catch (dlErr) {
+                if (isAbortError(dlErr) || isScanStopRequested) {
+                  throw dlErr;
                 }
-              }
-              if (filePaths.length === 0) {
-                throw dlErr;
+                // Fallback: check if media is already preserved in local archive
+                const existing = normalized ? await findDuplicateByUrl(link.url) : null;
+                if (existing?.fileName) {
+                  const candidateArchive = path.join(
+                    path.resolve(config.archiveDirectory),
+                    existing.channel || '',
+                    existing.fileName
+                  );
+                  if (fs.existsSync(candidateArchive)) {
+                    filePaths = [candidateArchive];
+                    console.log(`[Scanner] [W${workerId}] 📂 Reusing local archive copy for: ${truncateUrl(link.url)}`);
+                  }
+                }
+                if (filePaths.length === 0) {
+                  throw dlErr;
+                }
+              } finally {
+                activeScanDownloads = Math.max(0, activeScanDownloads - 1);
               }
             }
             const authorTag = message.author?.tag || message.author?.username || 'Unknown';
             const authorId = message.author?.id || '0';
-            const channelName = channel.name || 'chat';
             const postedAt = message.createdTimestamp || Date.now();
 
             const postRecordsToSave = [];
@@ -481,7 +546,20 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
 
               const fingerprint = await computeMediaFingerprint(filePath, link.url);
 
-              // Save high quality file to permanent PC archive
+              // Dual-Format High-Quality GIF Pipeline
+              let dualResult = { primaryFile: filePath, companionFiles: [], isGif: false };
+              if (config.enableGifPipeline) {
+                try {
+                  dualResult = await processDualFormatMedia(filePath, tempDir, {
+                    metadata: { is_gif: dlResult?.isOriginalGif },
+                    signal: scanAbortController?.signal,
+                  });
+                } catch (gifErr) {
+                  if (isAbortError(gifErr) || scanAbortController?.signal?.aborted) throw gifErr;
+                }
+              }
+
+              // Save high quality file to permanent PC archive (with dual-format companions if generated)
               const archivedPath = await archiveLocalMedia(filePath, {
                 url: link.url,
                 author: authorTag,
@@ -490,6 +568,7 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
                 mediaId: fingerprint.mediaId,
                 sha256: fingerprint.sha256,
                 subtitleFiles,
+                companionFiles: config.archiveBothFormats ? dualResult.companionFiles : [],
               });
 
               if (archivedPath) {
@@ -541,9 +620,13 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
 
                 // Prepare Discord attachment if upload is needed (use permanent archived file if present)
                 if (shouldUploadToDiscord) {
-                  const sourceForUpload = fs.existsSync(filePath) ? filePath : archivedPath;
-                  const uploadCandidate = await applyThumbnailPreview(sourceForUpload, tempDir);
-                  const finalPath = await ensureWithinLimit(uploadCandidate);
+                  const sourceForUpload = dualResult.primaryFile || (fs.existsSync(filePath) ? filePath : archivedPath);
+                  const isTargetGif = dualResult.isGif || path.extname(sourceForUpload).toLowerCase() === '.gif';
+                  let uploadCandidate = sourceForUpload;
+                  if (!isTargetGif && isVideoFile(sourceForUpload)) {
+                    uploadCandidate = await applyThumbnailPreview(sourceForUpload, tempDir, null, { signal: scanAbortController?.signal });
+                  }
+                  const finalPath = await ensureWithinLimit(uploadCandidate, null, null, { signal: scanAbortController?.signal });
                   if (finalPath) {
                     const finalExt = path.extname(finalPath);
                     const attachmentName = `${cleanTitle}${finalExt}`;
@@ -570,6 +653,10 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
               await saveRecord(record);
             }
           } catch (downloadErr) {
+            if (isAbortError(downloadErr) || isScanStopRequested) {
+              console.log(`[Scanner] [W${workerId}] 🛑 Download aborted by user: ${truncateUrl(link.url)}`);
+              break;
+            }
             stats.failedCount++;
             speedTracker.recordItem();
             console.warn(`[Scanner] [W${workerId}] ⚠️ Failed: ${truncateUrl(link.url)} (${downloadErr.message})`);
@@ -737,8 +824,12 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
     console.log(`[Scanner] 📨 Producer: Finished scanning history (${stats.messagesScanned.toLocaleString()} messages checked, ${workQueue.length} queued items to process in chronological order)`);
   }
 
-  // Wait for all workers to finish processing the queue
-  await Promise.all(workers);
+  try {
+    // Wait for all workers to finish processing the queue
+    await Promise.all(workers);
+  } finally {
+    scanAbortController = null;
+  }
 
   const totalElapsed = Date.now() - speedTracker.startTime;
   const avgSpeed = stats.totalBytesArchived > 0 && totalElapsed > 0

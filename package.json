@@ -1,6 +1,6 @@
 {
   "name": "archivist-fox",
-  "version": "3.11.1",
+  "version": "3.12.0",
   "description": "Archivist Fox - Discord bot that detects media links (direct files and social platforms), downloads the media, and replies with it as a file attachment.",
   "type": "module",
   "main": "src/index.js",
@@ -9,6 +9,9 @@
     "web": "node --use-system-ca src/web/server.js",
     "export-links": "node --use-system-ca scripts/export_links.js",
     "restore-links": "node --use-system-ca scripts/restore_links.js",
+    "deduplicate": "node --use-system-ca scripts/deduplicate_archive.js",
+    "convert-gifs": "node --use-system-ca scripts/convert_archive_to_gif.js",
+    "redownload-youtube": "node --use-system-ca scripts/redownload_youtube.js",
     "pixiv-login": "python scripts/pixiv_auth.py",
     "test": "node --use-system-ca --test tests/**/*.test.js",
     "test:watch": "node --use-system-ca --test --watch tests/**/*.test.js",

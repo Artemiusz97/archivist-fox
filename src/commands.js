@@ -208,7 +208,7 @@ export function getCommandDefinitions() {
 
   const stopCommand = new SlashCommandBuilder()
     .setName('stop')
-    .setDescription('Stops any currently running rescan, crawl, restoration, or queued background tasks')
+    .setDescription('Stops any active downloads, rescan, crawl, restoration, or queued background tasks')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages);
 
   return [
@@ -267,7 +267,7 @@ export function getHelpEmbed() {
           '• **`/export-links [channel] [format]`** — Export saved links into portable JSON, Markdown, and CSV backup files.',
           '• **`/restore <source> [target]`** (or `/restore-links`) — Repost saved links into current or target channel (with autocomplete!).',
           '• **`/rescan [channel] [limit] [missing_only] [force]`** — Scans message history to bulk-archive media to PC and backfill missed uploads.',
-          '• **`/stop`** — Stops any currently running channel rescan, restore session, or queued tasks.',
+          '• **`/stop`** — Stops active downloads, channel rescan, restore session, or queued tasks.',
         ].join('\n'),
         inline: false,
       },
@@ -289,7 +289,7 @@ export function getHelpEmbed() {
           `• **\`${config.rescanCommand} #channel\`** — Crawl a specific channel.`,
           `• **\`${config.rescanCommand} all\`** — Server-wide historical crawl across all readable channels.`,
           `• **\`!repost-missing\`** — Scans for media links that never received an attachment upload and reposts them.`,
-          `• **\`!stop\` / \`!cancel\`** — Stops the active channel rescan or crawl immediately.`,
+          `• **\`!stop\` / \`!cancel\`** — Stops active downloads, channel rescan, or crawl immediately.`,
         ].join('\n'),
         inline: false,
       },
@@ -952,16 +952,17 @@ export async function handleInteraction(interaction) {
         }
 
         const stopped = stopActiveTasks();
-        if (stopped.scanRunning || stopped.playlistRunning || stopped.restoreRunning || stopped.queueItemsCleared > 0) {
+        if (stopped.scanRunning || stopped.playlistRunning || stopped.restoreRunning || stopped.queueItemsCleared > 0 || stopped.activeDownloadsStopped > 0) {
           let msg = '🛑 **Stopped active tasks:**\n';
           if (stopped.scanRunning) msg += '• Aborted active channel rescan / media crawl.\n';
           if (stopped.restoreRunning) msg += '• Aborted active link restoration / reposting.\n';
           if (stopped.playlistRunning) msg += '• Aborted active playlist download.\n';
+          if (stopped.activeDownloadsStopped > 0) msg += `• Aborted **${stopped.activeDownloadsStopped}** download(s) in progress.\n`;
           if (stopped.queueItemsCleared > 0) msg += `• Cleared **${stopped.queueItemsCleared}** queued download(s).\n`;
           await interaction.reply({ content: msg });
         } else {
           await interaction.reply({
-            content: 'ℹ️ No active rescan, playlist download, restoration, or queued tasks are currently running.',
+            content: 'ℹ️ No active downloads, rescan, playlist download, restoration, or queued tasks are currently running.',
             flags: MessageFlags.Ephemeral,
           });
         }

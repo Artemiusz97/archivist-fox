@@ -8,12 +8,13 @@ import { downloadDirect } from './directDownloader.js';
 import { downloadWithYtDlp } from './ytdlpDownloader.js';
 import { downloadWithGalleryDl } from './galleryDlDownloader.js';
 import { compressVideo, compressAudio } from './compress.js';
-import { scheduleAutoDelete, getHumanJitterMs } from './utils.js';
+import { scheduleAutoDelete, getHumanJitterMs, isAbortError, sleep } from './utils.js';
 import { archiveLocalMedia } from './archiver.js';
 import { computeMediaFingerprint } from './phasher.js';
 import { findDuplicate, findDuplicateByUrl, saveRecord } from './db.js';
 import { downloadQueue } from './queue.js';
 import { applyThumbnailPreview, findThumbnailFile } from './thumbnailPreview.js';
+import { processDualFormatMedia } from './gifHandler.js';
 
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'webm', 'mkv', 'avi', 'm4v']);
 const AUDIO_EXTENSIONS = new Set(['mp3', 'ogg', 'wav', 'flac', 'm4a', 'opus', 'aac', 'alac', 'aiff']);
@@ -84,7 +85,7 @@ async function safeReply(message, options, overrideChannel = null) {
  * it's a video and compression is enabled. If thumbPath is provided, compressVideo
  * applies the thumbnail preview directly in the same encoding pass.
  */
-export async function ensureWithinLimit(filePath, onStatus, thumbPath = null) {
+export async function ensureWithinLimit(filePath, onStatus, thumbPath = null, options = {}) {
   const { size } = await fs.promises.stat(filePath);
   if (size <= config.maxFileSizeBytes) return filePath;
 
@@ -94,9 +95,9 @@ export async function ensureWithinLimit(filePath, onStatus, thumbPath = null) {
         if (onStatus) {
           await onStatus('compressing');
         }
-        return await compressVideo(filePath, config.maxFileSizeBytes, thumbPath);
+        return await compressVideo(filePath, config.maxFileSizeBytes, thumbPath, options);
       } catch (err) {
-        if (err?.message?.startsWith('QUALITY_PRESERVATION_LIMIT')) {
+        if (isAbortError(err) || err?.message?.startsWith('QUALITY_PRESERVATION_LIMIT')) {
           throw err;
         }
         return null;
@@ -106,9 +107,9 @@ export async function ensureWithinLimit(filePath, onStatus, thumbPath = null) {
         if (onStatus) {
           await onStatus('compressing');
         }
-        return await compressAudio(filePath, config.maxFileSizeBytes);
+        return await compressAudio(filePath, config.maxFileSizeBytes, options);
       } catch (err) {
-        if (err?.message?.startsWith('QUALITY_PRESERVATION_LIMIT')) {
+        if (isAbortError(err) || err?.message?.startsWith('QUALITY_PRESERVATION_LIMIT')) {
           throw err;
         }
         return null;
@@ -121,7 +122,8 @@ export async function ensureWithinLimit(filePath, onStatus, thumbPath = null) {
 /**
  * Internal execution pipeline for processing a message.
  */
-async function processMessage(message, links, options = {}, onStatus) {
+async function processMessage(message, links, options = {}, onStatus, signal = null) {
+  const effectiveSignal = signal || options?.signal || null;
   const tempDir = await makeTempDir();
   let totalUploaded = 0;
   let hasSuppressedEmbeds = false;
@@ -131,12 +133,18 @@ async function processMessage(message, links, options = {}, onStatus) {
 
   try {
     for (const link of links) {
+      if (effectiveSignal?.aborted) {
+        break;
+      }
       try {
         const normalized = normalizeUrl(link.url);
         const lockKey = normalized || link.url;
 
         if (inFlightDownloads.has(lockKey)) {
           await inFlightDownloads.get(lockKey).catch(() => {});
+        }
+        if (effectiveSignal?.aborted) {
+          break;
         }
 
         const workPromise = (async () => {
@@ -201,8 +209,8 @@ async function processMessage(message, links, options = {}, onStatus) {
             dlResult = [localArchiveCandidate];
           } else {
             dlResult = link.type === 'direct'
-              ? [await downloadDirect(link.url, tempDir, config.hardCapBytes)]
-              : await downloadPlatformLink(link.url, tempDir, 2, options);
+              ? [await downloadDirect(link.url, tempDir, config.hardCapBytes, { signal: effectiveSignal })]
+              : await downloadPlatformLink(link.url, tempDir, 2, { ...options, signal: effectiveSignal });
           }
 
           const filePaths = Array.isArray(dlResult) ? dlResult : (dlResult.mediaFiles || []);
@@ -229,12 +237,9 @@ async function processMessage(message, links, options = {}, onStatus) {
             // Compute multi-factor media fingerprint (Platform ID, SHA-256, Duration, Multi-Frame Hash)
             const fingerprint = await computeMediaFingerprint(filePath, link.url);
 
-            // Check for duplicate visual media against older posts (ignoring items from this same post)
+            // Check for duplicate visual media against older posts
             if (config.enableDuplicatePrevention && !options.force) {
-              const { match, reason, distance } = await findDuplicate(fingerprint, {
-                ignoreMediaId: currentMediaId,
-                ignoreOriginalUrl: link.url,
-              });
+              const { match, reason, distance } = await findDuplicate(fingerprint);
               if (match) {
                 const matchKey = match.mediaId || match.originalUrl || match.hash || link.url;
                 if (!notifiedDuplicateMedia.has(matchKey)) {
@@ -272,7 +277,22 @@ async function processMessage(message, links, options = {}, onStatus) {
               }
             }
 
+            // Dual-Format High-Quality GIF Pipeline (Detects short silent videos & original GIFs)
+            let dualResult = { primaryFile: filePath, companionFiles: [], isGif: false };
+            if (config.enableGifPipeline) {
+              try {
+                dualResult = await processDualFormatMedia(filePath, tempDir, {
+                  metadata: { is_gif: dlResult?.isOriginalGif },
+                  signal: effectiveSignal,
+                });
+              } catch (gifErr) {
+                if (isAbortError(gifErr) || effectiveSignal?.aborted) throw gifErr;
+                console.warn('[GIF Pipeline] Processing error, continuing with original file:', gifErr.message);
+              }
+            }
+
             // Permanently save uncompressed high-quality file to local archive folder on PC
+            // If dual-format was generated, companionFiles ensures both MP4 & GIF are preserved locally
             const archivedPath = await archiveLocalMedia(filePath, {
               url: link.url,
               author: authorTag,
@@ -281,6 +301,7 @@ async function processMessage(message, links, options = {}, onStatus) {
               mediaId: fingerprint.mediaId,
               sha256: fingerprint.sha256,
               subtitleFiles: subtitleFiles,
+              companionFiles: config.archiveBothFormats ? dualResult.companionFiles : [],
             });
 
             // Queue entry into media index database
@@ -297,29 +318,34 @@ async function processMessage(message, links, options = {}, onStatus) {
               fileName: archivedPath ? path.basename(archivedPath) : path.basename(filePath),
             });
 
-            // Check if file fits or needs compression
-            const originalStat = await fs.promises.stat(filePath).catch(() => null);
+            // Adaptive upload candidate: use GIF if fits within Discord limits, else fallback to pristine MP4
+            const uploadCandidate = dualResult.primaryFile || filePath;
+            const isTargetGif = dualResult.isGif || path.extname(uploadCandidate).toLowerCase() === '.gif';
+
+            // Check if file fits or needs compression (GIFs do not undergo lossy MP4 re-encoding)
+            const originalStat = await fs.promises.stat(uploadCandidate).catch(() => null);
             const originalFileSize = originalStat ? originalStat.size : 0;
             const needsCompression =
-              config.enableCompression && isVideo(filePath) && originalFileSize > config.maxFileSizeBytes;
+              config.enableCompression && !isTargetGif && isVideo(uploadCandidate) && originalFileSize > config.maxFileSizeBytes;
 
             let discoveredThumbPath = null;
-            if (config.prependThumbnailPreview && isVideo(filePath)) {
-              discoveredThumbPath = await findThumbnailFile(filePath, tempDir);
+            if (config.prependThumbnailPreview && !isTargetGif && isVideo(uploadCandidate)) {
+              discoveredThumbPath = await findThumbnailFile(uploadCandidate, tempDir);
             }
 
-            let uploadCandidatePath = filePath;
+            let uploadCandidatePath = uploadCandidate;
             // If the video already fits within limit, inject thumbnail directly (fast single pass)
             // If oversized, compressVideo will inject discoveredThumbPath directly during compression (single pass)
             if (!needsCompression && discoveredThumbPath) {
-              uploadCandidatePath = await applyThumbnailPreview(filePath, tempDir, discoveredThumbPath);
+              uploadCandidatePath = await applyThumbnailPreview(uploadCandidate, tempDir, discoveredThumbPath, { signal: effectiveSignal });
             }
 
             try {
               const finalPath = await ensureWithinLimit(
                 uploadCandidatePath,
                 onStatus,
-                needsCompression ? discoveredThumbPath : null
+                needsCompression ? discoveredThumbPath : null,
+                { signal: effectiveSignal }
               );
               if (finalPath) {
                 const finalExt = path.extname(finalPath);
@@ -500,12 +526,16 @@ async function processMessage(message, links, options = {}, onStatus) {
           }
         }
       } catch (err) {
+        if (isAbortError(err) || effectiveSignal?.aborted) {
+          console.log(`[Downloader] Download of <${link.url}> was stopped by user.`);
+          break;
+        }
         console.error(`Failed to download ${link.url}:`, err);
         failures.push({ url: link.url, reason: describeError(err) });
       }
     }
 
-    if (failures.length > 0) {
+    if (failures.length > 0 && !effectiveSignal?.aborted) {
       // Cap displayed failures to the first 5 entries to stay within Discord's
       // 2,000-character content limit when a user pastes a large batch of URLs.
       const MAX_SHOWN = 5;
@@ -522,7 +552,12 @@ async function processMessage(message, links, options = {}, onStatus) {
       scheduleAutoDelete(notice);
     }
 
-    return { found: links.length, uploaded: totalUploaded, failed: failures.length };
+    return {
+      found: links.length,
+      uploaded: totalUploaded,
+      failed: failures.length,
+      stopped: Boolean(effectiveSignal?.aborted),
+    };
   } finally {
     await cleanup(tempDir);
   }
@@ -568,8 +603,8 @@ export async function handleMessage(message, options = {}) {
   );
 
   // Route through download concurrency queue with live Method 3 status indicators
-  return downloadQueue.add(message, ({ onStatus }) =>
-    processMessage(message, links, { ...options, duplicateNormalizedSet }, onStatus)
+  return downloadQueue.add(message, ({ onStatus, signal }) =>
+    processMessage(message, links, { ...options, duplicateNormalizedSet }, onStatus, signal)
   );
 }
 
@@ -610,21 +645,32 @@ function describeError(err) {
  */
 async function downloadPlatformLink(url, destDir, maxRetries = 2, dlOptions = {}) {
   let lastErr = null;
-  const options = { extractAudio: isAudioUrl(url) };
+  const signal = dlOptions?.signal;
+  if (signal?.aborted) {
+    throw new Error('DOWNLOAD_ABORTED');
+  }
+
+  const options = { extractAudio: isAudioUrl(url), signal };
 
   // Anti-Bot: apply randomized human reaction jitter on initial request attempt
   if (config.enableHumanJitter && !dlOptions.skipJitter) {
     const jitterMs = getHumanJitterMs(config.humanJitterMinMs, config.humanJitterMaxMs);
     console.log(`[Anti-Bot] ⏳ Applied human jitter delay (${(jitterMs / 1000).toFixed(1)}s) before requesting <${url}>`);
-    await new Promise((r) => setTimeout(r, jitterMs));
+    await sleep(jitterMs, signal);
   }
 
   // DeviantArt fast-path: yt-dlp has no DeviantArt extractor, so skip directly to gallery-dl.
   if (isDeviantArtUrl(url)) {
     for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+      if (signal?.aborted) {
+        throw new Error('DOWNLOAD_ABORTED');
+      }
       try {
-        return await downloadWithGalleryDl(url, destDir);
+        return await downloadWithGalleryDl(url, destDir, { signal });
       } catch (err) {
+        if (isAbortError(err) || signal?.aborted) {
+          throw err;
+        }
         lastErr = err;
         const isTransient =
           err?.message?.includes('TIMEOUT') ||
@@ -637,7 +683,7 @@ async function downloadPlatformLink(url, destDir, maxRetries = 2, dlOptions = {}
           console.warn(
             `[Downloader] DeviantArt download of <${url}> hit transient error (${err.message}), retrying attempt ${attempt + 1}/${maxRetries + 1}...`
           );
-          await new Promise((r) => setTimeout(r, attempt * 3000));
+          await sleep(attempt * 3000, signal);
           continue;
         }
         break;
@@ -647,16 +693,25 @@ async function downloadPlatformLink(url, destDir, maxRetries = 2, dlOptions = {}
   }
 
   for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    if (signal?.aborted) {
+      throw new Error('DOWNLOAD_ABORTED');
+    }
     try {
       return await downloadWithYtDlp(url, destDir, options);
     } catch (ytErr) {
+      if (isAbortError(ytErr) || signal?.aborted) {
+        throw ytErr;
+      }
       const msg = ytErr?.message || '';
       if (msg.startsWith('COMMAND_NOT_FOUND')) {
         throw ytErr;
       }
       try {
-        return await downloadWithGalleryDl(url, destDir);
+        return await downloadWithGalleryDl(url, destDir, { signal });
       } catch (galleryErr) {
+        if (isAbortError(galleryErr) || signal?.aborted) {
+          throw galleryErr;
+        }
         if (galleryErr?.message?.includes('Unsupported URL')) {
           lastErr = ytErr;
         } else {
@@ -674,7 +729,7 @@ async function downloadPlatformLink(url, destDir, maxRetries = 2, dlOptions = {}
           console.warn(
             `[Downloader] Download of <${url}> encountered transient error (${lastErr.message}), retrying attempt ${attempt + 1}/${maxRetries + 1}...`
           );
-          await new Promise((r) => setTimeout(r, attempt * 3000));
+          await sleep(attempt * 3000, signal);
           continue;
         }
       }

@@ -65,6 +65,94 @@ export function killProcessTree(child) {
   }
 }
 
+const activeDownloadProcesses = new Set();
+
+/**
+ * Registers an active child process spawned for downloading or media processing.
+ *
+ * @param {import('node:child_process').ChildProcess} child
+ */
+export function registerDownloadProcess(child) {
+  if (!child || !child.pid) return;
+  activeDownloadProcesses.add(child);
+  const cleanup = () => {
+    activeDownloadProcesses.delete(child);
+  };
+  child.once('close', cleanup);
+  child.once('error', cleanup);
+}
+
+/**
+ * Unregisters an active child process.
+ *
+ * @param {import('node:child_process').ChildProcess} child
+ */
+export function unregisterDownloadProcess(child) {
+  activeDownloadProcesses.delete(child);
+}
+
+/**
+ * Terminates all tracked active download/media processes across OSes.
+ *
+ * @returns {number} The count of processes terminated.
+ */
+export function killAllDownloadProcesses() {
+  const count = activeDownloadProcesses.size;
+  for (const child of activeDownloadProcesses) {
+    killProcessTree(child);
+  }
+  activeDownloadProcesses.clear();
+  return count;
+}
+
+/**
+ * Returns true if an error was caused by an intentional task/download abortion.
+ *
+ * @param {any} err
+ * @returns {boolean}
+ */
+export function isAbortError(err) {
+  if (!err) return false;
+  return (
+    err.name === 'AbortError' ||
+    err.code === 'ERR_CANCELED' ||
+    err.code === 'ABORT_ERR' ||
+    err.message === 'DOWNLOAD_ABORTED' ||
+    err.message === 'canceled' ||
+    err.message?.includes('DOWNLOAD_ABORTED')
+  );
+}
+
+/**
+ * Abortable asynchronous sleep helper.
+ *
+ * @param {number} ms - Milliseconds to sleep.
+ * @param {AbortSignal} [signal] - Optional AbortSignal to cancel sleep immediately.
+ * @returns {Promise<void>}
+ */
+export function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      return reject(new Error('DOWNLOAD_ABORTED'));
+    }
+    let timer = null;
+    let onAbort = null;
+    if (signal) {
+      onAbort = () => {
+        if (timer) clearTimeout(timer);
+        reject(new Error('DOWNLOAD_ABORTED'));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    timer = setTimeout(() => {
+      if (signal && onAbort) {
+        signal.removeEventListener('abort', onAbort);
+      }
+      resolve();
+    }, ms);
+  });
+}
+
 /**
  * Cleans up leftover archivist-fox-* temporary directories in os.tmpdir()
  * older than maxAgeMs (default: 1 hour).

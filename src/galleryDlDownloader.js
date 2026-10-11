@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { config } from './config.js';
 import { getGalleryDlConfigPath } from './galleryDlConfig.js';
 import { getCookieForUrl } from './cookieVault.js';
-import { killProcessTree, getBrowserUserAgent } from './utils.js';
+import { killProcessTree, getBrowserUserAgent, registerDownloadProcess, unregisterDownloadProcess } from './utils.js';
 import { checkNsfwInMetadata } from './urlExtractor.js';
 
 const TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes (allows buffer for platform rate-limit waits)
@@ -15,7 +15,11 @@ const TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes (allows buffer for platform rate-
  * galleries, unlike yt-dlp which targets video. Returns an array of
  * downloaded file paths with isNsfw property.
  */
-export async function downloadWithGalleryDl(url, destDir) {
+export async function downloadWithGalleryDl(url, destDir, options = {}) {
+  if (options?.signal?.aborted) {
+    throw new Error('DOWNLOAD_ABORTED');
+  }
+
   await fs.promises.mkdir(destDir, { recursive: true });
 
   const hardCapMB = Math.max(1, Math.floor(config.hardCapBytes / (1024 * 1024)));
@@ -47,9 +51,9 @@ export async function downloadWithGalleryDl(url, destDir) {
   args.push(url);
 
   if (config.usePythonGalleryDl) {
-    await runProcess('python3', ['-m', 'gallery_dl', ...args]);
+    await runProcess('python3', ['-m', 'gallery_dl', ...args], options?.signal);
   } else {
-    await runProcess(config.gallerydlPath, args);
+    await runProcess(config.gallerydlPath, args, options?.signal);
   }
 
   const allFiles = await walkFiles(destDir);
@@ -91,15 +95,32 @@ async function walkFiles(dir) {
   return results;
 }
 
-function runProcess(cmd, args) {
+function runProcess(cmd, args, signal) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      return reject(new Error('DOWNLOAD_ABORTED'));
+    }
+
     const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    registerDownloadProcess(child);
     let stderr = '';
 
     const timer = setTimeout(() => {
+      unregisterDownloadProcess(child);
       killProcessTree(child);
       reject(new Error(`TIMEOUT: ${cmd} took too long`));
     }, TIMEOUT_MS);
+
+    const onAbort = () => {
+      clearTimeout(timer);
+      unregisterDownloadProcess(child);
+      killProcessTree(child);
+      reject(new Error('DOWNLOAD_ABORTED'));
+    };
+
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
 
     child.stderr.on('data', (chunk) => {
       stderr += chunk.toString();
@@ -107,6 +128,8 @@ function runProcess(cmd, args) {
 
     child.on('error', (err) => {
       clearTimeout(timer);
+      unregisterDownloadProcess(child);
+      if (signal) signal.removeEventListener('abort', onAbort);
       if (err.code === 'ENOENT') {
         reject(new Error(`COMMAND_NOT_FOUND: ${cmd} is not installed or not on PATH`));
       } else {
@@ -116,7 +139,11 @@ function runProcess(cmd, args) {
 
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (code === 0) {
+      unregisterDownloadProcess(child);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (signal?.aborted) {
+        reject(new Error('DOWNLOAD_ABORTED'));
+      } else if (code === 0) {
         resolve();
       } else {
         reject(new Error(`${cmd} exited with code ${code}: ${stderr.trim()}`));

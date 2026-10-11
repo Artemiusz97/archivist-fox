@@ -81,6 +81,10 @@ the media, and replies to the original poster with it as a file attachment.
 | `AUDIO_FORMAT` | `mp3` | Target audio format for downloaded songs/tracks |
 | `AUDIO_QUALITY` | `0` | VBR audio quality (`0` = highest quality / ~320kbps) |
 | `MAX_AUDIO_BITRATE_KBPS` | `320` | Max audio bitrate allowed before compressing oversized audio |
+| `ENABLE_GIF_PIPELINE` | `true` | Automatically detect short silent videos or platform GIFs and generate high-fidelity GIFs |
+| `GIF_MAX_DURATION_SECONDS` | `6` | Maximum duration (seconds) of a silent video clip to qualify for GIF conversion |
+| `GIF_MAX_FPS` | `30` | Maximum framerate for generated GIFs (`10` to `50`, default `30`) |
+| `ARCHIVE_BOTH_FORMATS` | `true` | Preserve both `.gif` and `.mp4` companion files in the local PC archive |
 | `ENABLE_LOCAL_ARCHIVE` | `true` | Permanently save full-quality uncompressed media to your local PC |
 | `ARCHIVE_DIRECTORY` | `./archives` | Folder path on your PC where original files are preserved |
 | `ARCHIVE_SAVE_METADATA` | `true` | Save a matching `.json` metadata file (URL, author, channel, date) alongside media |
@@ -151,7 +155,7 @@ Archivist Fox includes modern Discord Application Commands:
   - Disaster recovery tool that reposts links from backup files sequentially into Discord channels with rate-limit safe pacing and channel auto-creation.
   - Prefix command equivalent: `!restore misc-links` (or `!restore all`).
 - **`/stop`**:
-  - Immediately aborts and halts any running `/rescan` channel crawl, `/restore` link restoration session, bulk archiving, or queued background tasks.
+  - Immediately aborts and halts any active downloads in progress (including yt-dlp, gallery-dl, and direct streams), `/rescan` channel crawl, `/restore` link restoration session, bulk archiving, or queued background tasks.
 - **Duplicate Notice "Delete Post" & "Dismiss" Buttons**:
   - When all links in a message are duplicates, the bot attaches both a `🗑️ Delete Post` button and a `✖️ Dismiss` button. The original poster or server moderators can delete the duplicate message and alert in one click.
 
@@ -262,9 +266,37 @@ You can track and backup links in specific channels without having the bot downl
 - Specify channels in `LINK_BACKUP_CHANNELS` without adding them to `ALLOWED_CHANNEL_IDS`.
 - Archivist Fox will silently index every link and original user message commentary into SQLite for backup and disaster recovery, while leaving chat completely untouched (no media downloads, no uploads, and no duplicate alerts).
 
+## Dual-Format High-Quality GIF & Animation Pipeline
+
+Social platforms like X/Twitter and Reddit store "GIFs" internally as silent looping MP4 videos. Archivist Fox automatically detects GIF candidates and handles them with a full-fidelity dual-format pipeline (`ENABLE_GIF_PIPELINE=true`):
+- **Automatic Detection**: Identifies direct `.gif` uploads, platform GIFs flagged by metadata (`is_gif`, `/tweet_video/`), and short silent video clips (`<= GIF_MAX_DURATION_SECONDS`, default `6s`, with no audio stream).
+- **Two-Pass Custom Palette Generation**: Uses FFmpeg's `palettegen=stats_mode=full` and `paletteuse=dither=sierra2_4a` at full original resolution (up to `GIF_MAX_FPS`, default `30` FPS) for crisp color fidelity without banding.
+- **Adaptive Discord Upload Fallback**:
+  - If the generated full-fidelity `.gif` fits within your server's `MAX_FILE_SIZE_MB`, the bot uploads it as a native `.gif` so it auto-loops inline in Discord chat.
+  - If the `.gif` exceeds Discord's upload limit, the bot automatically switches to near-lossless `.mp4` (`CRF 18`) for Discord delivery rather than degrading GIF resolution or colors.
+- **Dual-Format PC Preservation (`ARCHIVE_BOTH_FORMATS=true`)**: Saves both the `.gif` and `.mp4` files side-by-side in your local `./archives` directory and records companion filenames in the `.json` metadata sidecar.
+
+## Archive Maintenance & Quality Upgrade CLI Tools
+
+Archivist Fox includes standalone command-line utilities in `scripts/` for maintaining and upgrading your existing `./archives` collection:
+
+```bash
+# Retroactively scan ./archives for short silent videos and generate companion high-quality .gif files
+npm run convert-gifs
+# Options: --dry-run, --channel=<name>, --max-duration=6, --fps=30, --force
+
+# Scan ./archives for duplicate media files created by historical filename collisions,
+# merge metadata into the primary sidecar, update SQLite records, and reclaim disk space
+npm run deduplicate
+# Options: --dry-run, --channel=<name>
+
+# Upgrade older low-resolution (360p) archived YouTube videos to 1080p/4K with 4x concurrent fragments
+npm run redownload-youtube
+```
+
 ## Running Tests
 
-Archivist Fox includes a native test suite with 69 unit and integration tests covering commands, configuration, database operations, export formatting, and URL extraction:
+Archivist Fox includes a native test suite with 94 unit and integration tests across 35 suites covering commands, configuration, database operations, dual-format GIF processing, idempotent archiving, task cancellation (`/stop`), export formatting, and URL extraction:
 
 ```bash
 # Run all tests

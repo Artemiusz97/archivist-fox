@@ -57,6 +57,12 @@ export const config = {
   audioQuality: process.env.AUDIO_QUALITY || '0', // 0 = best VBR for yt-dlp
   maxAudioBitrateKbps: Math.max(32, Number(process.env.MAX_AUDIO_BITRATE_KBPS || 320)),
 
+  // High-Quality GIF Pipeline & Dual-Format Options
+  enableGifPipeline: parseBool(process.env.ENABLE_GIF_PIPELINE, true),
+  gifMaxDurationSeconds: Math.max(1, Number(process.env.GIF_MAX_DURATION_SECONDS || 6)),
+  gifMaxFps: Math.max(10, Math.min(50, Number(process.env.GIF_MAX_FPS || 30))),
+  archiveBothFormats: parseBool(process.env.ARCHIVE_BOTH_FORMATS, true),
+
   ytdlpPath: resolveBinaryPath(process.env.YTDLP_PATH, 'yt-dlp'),
   gallerydlPath: resolveBinaryPath(process.env.GALLERYDL_PATH, 'gallery-dl'),
   usePythonGalleryDl: false,

@@ -123,8 +123,10 @@ async function handleRetryCommand(commandMessage, isForce = false, cmd = '!retry
   try {
     hourglassReaction = await commandMessage.react('⏳').catch(() => null);
     const target = await commandMessage.fetchReference();
-    await handleMessage(target, { notifyIfEmpty: true, force: isForce });
-    await commandMessage.react('✅').catch(() => {});
+    const result = await handleMessage(target, { notifyIfEmpty: true, force: isForce });
+    if (!result?.stopped) {
+      await commandMessage.react('✅').catch(() => {});
+    }
   } catch (err) {
     console.error(`Retry command failed for message ${commandMessage.id}:`, err);
     await commandMessage.react('❌').catch(() => {});
@@ -171,17 +173,18 @@ client.on('messageCreate', async (message) => {
       }
 
       const stopped = stopActiveTasks();
-      if (stopped.scanRunning || stopped.playlistRunning || stopped.restoreRunning || stopped.queueItemsCleared > 0) {
+      if (stopped.scanRunning || stopped.playlistRunning || stopped.restoreRunning || stopped.queueItemsCleared > 0 || stopped.activeDownloadsStopped > 0) {
         let msg = '🛑 **Stopped active tasks:**\n';
         if (stopped.scanRunning) msg += '• Aborted active channel rescan / media crawl.\n';
         if (stopped.restoreRunning) msg += '• Aborted active link restoration / reposting.\n';
         if (stopped.playlistRunning) msg += '• Aborted active playlist download.\n';
+        if (stopped.activeDownloadsStopped > 0) msg += `• Aborted **${stopped.activeDownloadsStopped}** download(s) in progress.\n`;
         if (stopped.queueItemsCleared > 0) msg += `• Cleared **${stopped.queueItemsCleared}** queued download(s).\n`;
         const notice = await message.reply({ content: msg, allowedMentions: { repliedUser: false } });
         scheduleAutoDelete(notice);
       } else {
         const notice = await message.reply({
-          content: 'ℹ️ No active rescan, playlist download, restoration, or queued tasks are currently running.',
+          content: 'ℹ️ No active downloads, rescan, playlist download, restoration, or queued tasks are currently running.',
           allowedMentions: { repliedUser: false },
         });
         scheduleAutoDelete(notice);

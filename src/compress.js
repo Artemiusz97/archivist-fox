@@ -2,29 +2,48 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { config } from './config.js';
-import { killProcessTree } from './utils.js';
+import { killProcessTree, registerDownloadProcess, unregisterDownloadProcess, isAbortError } from './utils.js';
 
 const AUDIO_BITRATE_KBPS = 96;
 const SAFETY_MARGIN = 0.92; // leave some headroom under the target size
 
 let detectedGpuEncoder = undefined;
 
-export function run(cmd, args, timeoutMs = 4 * 60 * 1000) {
+export function run(cmd, args, timeoutMs = 4 * 60 * 1000, signal) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      return reject(new Error('DOWNLOAD_ABORTED'));
+    }
+
     const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    registerDownloadProcess(child);
     let stdout = '';
     let stderr = '';
 
     const timer = setTimeout(() => {
+      unregisterDownloadProcess(child);
       killProcessTree(child);
       reject(new Error(`TIMEOUT: ${cmd} took too long (${Math.round(timeoutMs / 1000)}s limit)`));
     }, timeoutMs);
+
+    const onAbort = () => {
+      clearTimeout(timer);
+      unregisterDownloadProcess(child);
+      killProcessTree(child);
+      reject(new Error('DOWNLOAD_ABORTED'));
+    };
+
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
 
     child.stdout.on('data', (d) => (stdout += d.toString()));
     child.stderr.on('data', (d) => (stderr += d.toString()));
 
     child.on('error', (err) => {
       clearTimeout(timer);
+      unregisterDownloadProcess(child);
+      if (signal) signal.removeEventListener('abort', onAbort);
       if (err.code === 'ENOENT') {
         reject(new Error(`COMMAND_NOT_FOUND: ${cmd} is not installed or not on PATH`));
       } else {
@@ -34,7 +53,11 @@ export function run(cmd, args, timeoutMs = 4 * 60 * 1000) {
 
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (code === 0) resolve({ stdout, stderr });
+      unregisterDownloadProcess(child);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (signal?.aborted) {
+        reject(new Error('DOWNLOAD_ABORTED'));
+      } else if (code === 0) resolve({ stdout, stderr });
       else reject(new Error(`${cmd} exited with code ${code}: ${stderr.slice(-500)}`));
     });
   });
@@ -144,7 +167,12 @@ async function getMediaInfo(filePath) {
  * injects the 0.15s preview overlay directly in the same encoding pass.
  * Returns the path to a new, smaller file, or throws if it can't get under the limit.
  */
-export async function compressVideo(inputPath, maxBytes, thumbPath = null) {
+export async function compressVideo(inputPath, maxBytes, thumbPath = null, options = {}) {
+  const signal = options?.signal;
+  if (signal?.aborted) {
+    throw new Error('DOWNLOAD_ABORTED');
+  }
+
   const { duration, audioCodec, audioBitrate, width, height } = await getMediaInfo(inputPath);
   const videoDim = { width, height };
   const attempts = [
@@ -174,6 +202,10 @@ export async function compressVideo(inputPath, maxBytes, thumbPath = null) {
     : ['-c:a', 'aac', '-b:a', `${AUDIO_BITRATE_KBPS}k`];
 
   for (const attempt of attempts) {
+    if (signal?.aborted) {
+      throw new Error('DOWNLOAD_ABORTED');
+    }
+
     // If copying audio, subtract the actual source audio bitrate, otherwise subtract our target audio bitrate
     const estimatedAudioKbps = canCopyAudio ? (audioBitrate / 1000) : AUDIO_BITRATE_KBPS;
     const targetTotalKbps = (maxBytes * 8 * SAFETY_MARGIN) / duration / 1000;
@@ -194,7 +226,8 @@ export async function compressVideo(inputPath, maxBytes, thumbPath = null) {
       maxBytes,
       audioArgs,
       thumbPath,
-      videoDim
+      videoDim,
+      signal
     );
     if (success) return outputPath;
 
@@ -210,7 +243,8 @@ export async function compressVideo(inputPath, maxBytes, thumbPath = null) {
         maxBytes,
         audioArgs,
         thumbPath,
-        videoDim
+        videoDim,
+        signal
       );
       if (success) return outputPath;
     }
@@ -230,7 +264,8 @@ async function tryEncode(
   maxBytes,
   audioArgs,
   thumbPath = null,
-  videoDim = null
+  videoDim = null,
+  signal = null
 ) {
   const encArgs = getEncoderArgs(encoder, videoKbps);
   const args = ['-y', '-i', inputPath];
@@ -269,7 +304,7 @@ async function tryEncode(
   args.push(...encArgs, ...audioArgs, '-movflags', '+faststart', outputPath);
 
   try {
-    await run(config.ffmpegPath, args);
+    await run(config.ffmpegPath, args, 4 * 60 * 1000, signal);
     const { size } = await fs.promises.stat(outputPath);
     if (size <= maxBytes) {
       return true;
@@ -278,11 +313,19 @@ async function tryEncode(
     return false;
   } catch (err) {
     await fs.promises.unlink(outputPath).catch(() => {});
+    if (isAbortError(err) || signal?.aborted) {
+      throw err;
+    }
     return false;
   }
 }
 
-export async function compressAudio(inputPath, maxBytes) {
+export async function compressAudio(inputPath, maxBytes, options = {}) {
+  const signal = options?.signal;
+  if (signal?.aborted) {
+    throw new Error('DOWNLOAD_ABORTED');
+  }
+
   const { duration } = await getMediaInfo(inputPath);
   
   // Audio quality preservation gate: don't compress below 32 kbps (e.g. extremely long audio)
@@ -309,7 +352,7 @@ export async function compressAudio(inputPath, maxBytes) {
   ];
 
   try {
-    await run(config.ffmpegPath, args);
+    await run(config.ffmpegPath, args, 4 * 60 * 1000, signal);
     const { size } = await fs.promises.stat(outputPath);
     if (size <= maxBytes) {
       return outputPath;
@@ -318,6 +361,9 @@ export async function compressAudio(inputPath, maxBytes) {
     return null;
   } catch (err) {
     await fs.promises.unlink(outputPath).catch(() => {});
+    if (isAbortError(err) || signal?.aborted) {
+      throw err;
+    }
     return null;
   }
 }

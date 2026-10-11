@@ -8,6 +8,7 @@ import { downloadWithGalleryDl } from './galleryDlDownloader.js';
 import { archiveLocalMedia } from './archiver.js';
 import { computeMediaFingerprint } from './phasher.js';
 import { findDuplicate, findDuplicateByUrl, saveRecord } from './db.js';
+import { processDualFormatMedia } from './gifHandler.js';
 import {
   extractPlatformMediaId,
   normalizeUrl,
@@ -15,7 +16,7 @@ import {
   isDeviantArtUrl,
   extractMediaLinksAsync,
 } from './urlExtractor.js';
-import { getHumanJitterMs, sanitizePathSegment } from './utils.js';
+import { getHumanJitterMs, sanitizePathSegment, isAbortError, sleep } from './utils.js';
 
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'webm', 'mkv', 'avi', 'm4v']);
 const AUDIO_EXTENSIONS = new Set(['mp3', 'ogg', 'wav', 'flac', 'm4a', 'opus', 'aac', 'alac', 'aiff']);
@@ -51,22 +52,34 @@ async function cleanupDir(dir) {
  */
 export async function downloadPlatformMedia(url, destDir, maxRetries = 2, dlOptions = {}) {
   let lastErr = null;
+  const signal = dlOptions?.signal;
+  if (signal?.aborted) {
+    throw new Error('DOWNLOAD_ABORTED');
+  }
+
   const options = {
     extractAudio: dlOptions.audioOnly || isAudioUrl(url),
+    signal,
   };
 
   // Anti-Bot: apply randomized human reaction jitter on initial request attempt
   if (config.enableHumanJitter && !dlOptions.skipJitter) {
     const jitterMs = getHumanJitterMs(config.humanJitterMinMs, config.humanJitterMaxMs);
-    await new Promise((r) => setTimeout(r, jitterMs));
+    await sleep(jitterMs, signal);
   }
 
   // DeviantArt fast-path: yt-dlp has no DeviantArt extractor, so skip directly to gallery-dl.
   if (isDeviantArtUrl(url)) {
     for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+      if (signal?.aborted) {
+        throw new Error('DOWNLOAD_ABORTED');
+      }
       try {
-        return await downloadWithGalleryDl(url, destDir);
+        return await downloadWithGalleryDl(url, destDir, { signal });
       } catch (err) {
+        if (isAbortError(err) || signal?.aborted) {
+          throw err;
+        }
         lastErr = err;
         const isTransient =
           err?.message?.includes('TIMEOUT') ||
@@ -76,7 +89,7 @@ export async function downloadPlatformMedia(url, destDir, maxRetries = 2, dlOpti
           err?.message?.includes('ETIMEDOUT');
 
         if (isTransient && attempt <= maxRetries) {
-          await new Promise((r) => setTimeout(r, attempt * 3000));
+          await sleep(attempt * 3000, signal);
           continue;
         }
         break;
@@ -86,16 +99,25 @@ export async function downloadPlatformMedia(url, destDir, maxRetries = 2, dlOpti
   }
 
   for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    if (signal?.aborted) {
+      throw new Error('DOWNLOAD_ABORTED');
+    }
     try {
       return await downloadWithYtDlp(url, destDir, options);
     } catch (ytErr) {
+      if (isAbortError(ytErr) || signal?.aborted) {
+        throw ytErr;
+      }
       const msg = ytErr?.message || '';
       if (msg.startsWith('COMMAND_NOT_FOUND')) {
         throw ytErr;
       }
       try {
-        return await downloadWithGalleryDl(url, destDir);
+        return await downloadWithGalleryDl(url, destDir, { signal });
       } catch (galleryErr) {
+        if (isAbortError(galleryErr) || signal?.aborted) {
+          throw galleryErr;
+        }
         if (galleryErr?.message?.includes('Unsupported URL')) {
           lastErr = ytErr;
         } else {
@@ -110,7 +132,7 @@ export async function downloadPlatformMedia(url, destDir, maxRetries = 2, dlOpti
           lastErr?.message?.includes('ETIMEDOUT');
 
         if (isTransient && attempt <= maxRetries) {
-          await new Promise((r) => setTimeout(r, attempt * 3000));
+          await sleep(attempt * 3000, signal);
           continue;
         }
       }
@@ -186,10 +208,10 @@ export async function downloadMediaItem(url, options = {}) {
 
     let dlResult;
     if (linkType === 'direct') {
-      const filePath = await downloadDirect(url, tempDir, config.hardCapBytes);
+      const filePath = await downloadDirect(url, tempDir, config.hardCapBytes, { signal: options.signal });
       dlResult = [filePath];
     } else {
-      dlResult = await downloadPlatformMedia(url, tempDir, 2, { audioOnly });
+      dlResult = await downloadPlatformMedia(url, tempDir, 2, { audioOnly, signal: options.signal });
     }
 
     const filePaths = Array.isArray(dlResult) ? dlResult : dlResult.mediaFiles || [];
@@ -212,10 +234,7 @@ export async function downloadMediaItem(url, options = {}) {
 
       // 4. Visual duplicate detection against older media
       if (config.enableDuplicatePrevention && !force) {
-        const { match, reason, distance } = await findDuplicate(fingerprint, {
-          ignoreMediaId: fingerprint.mediaId,
-          ignoreOriginalUrl: url,
-        });
+        const { match, reason, distance } = await findDuplicate(fingerprint);
 
         if (match) {
           onProgress({
@@ -241,6 +260,20 @@ export async function downloadMediaItem(url, options = {}) {
         }
       }
 
+      // Dual-Format GIF Pipeline
+      let companionFiles = [];
+      if (config.enableGifPipeline) {
+        try {
+          const dualResult = await processDualFormatMedia(filePath, tempDir, {
+            metadata: { is_gif: dlResult?.isOriginalGif },
+            signal: options.signal,
+          });
+          companionFiles = dualResult.companionFiles || [];
+        } catch (gifErr) {
+          if (isAbortError(gifErr) || options.signal?.aborted) throw gifErr;
+        }
+      }
+
       // 5. Permanent local archiving
       let finalFilePath = filePath;
       let archivedPath = null;
@@ -255,6 +288,7 @@ export async function downloadMediaItem(url, options = {}) {
           mediaId: fingerprint.mediaId,
           sha256: fingerprint.sha256,
           subtitleFiles,
+          companionFiles: config.archiveBothFormats ? companionFiles : [],
         });
 
         if (archivedPath) {

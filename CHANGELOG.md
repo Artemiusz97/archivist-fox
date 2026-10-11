@@ -23,6 +23,7 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 
 | Version | Release Date | Type | Primary Milestone / Theme |
 | :--- | :--- | :--- | :--- |
+| **[v3.12.0](#v3120---2026-10-11)** | 2026-10-11 | Minor | Dual-Format High-Quality GIF Pipeline, Idempotent Local Archiver, Instant `/stop` Subprocess Termination, Archive Maintenance CLI Suite (`convert-gifs`, `deduplicate`, `redownload-youtube`), and 94-Test Native Suite. |
 | **[v3.11.1](#v3111---2026-09-26)** | 2026-09-26 | Patch | Link Backup Decoupling, Enhanced Crawler Telemetry, Privacy Hardening & Discord.js v14 Modernization. |
 | **[v3.11.0](#v3110---2026-09-24)** | 2026-09-24 | Minor | Link Backup & Disaster Recovery Suite: Multi-format link exporter (JSON, Markdown, CSV), automated link restoration & reposting engine (`/restore`, `!restore`, CLI), message context preservation, channel slug normalization, and comprehensive 69-test native suite. |
 | **[v3.10.0](#v3100---2026-09-22)** | 2026-09-22 | Minor | Web UI & Downloader Dashboard, NSFW Auto-Spoiler Engine, Per-Link Streaming Uploads, Interactive Duplicate Cleanup (`Delete Post`), Force Re-upload (`!reup`), Auto-Delete Command Messages, Pixiv OAuth Helper. |
@@ -52,6 +53,29 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 ---
 
 ## Release Details
+
+### [v3.12.0] - 2026-10-11
+
+#### Added & Improved
+- **Dual-Format High-Quality GIF & Animation Pipeline (`src/gifHandler.js`, `src/mediaHandler.js`, `src/downloaderCore.js`, `src/scanner.js`, `src/ytdlpDownloader.js`, `src/config.js`, `.env.example`)**:
+  - Automatically detects GIF candidates across live Discord messages, the Web UI downloader, and `/rescan` history crawls: direct `.gif` files, platform GIFs flagged by scraper metadata (`is_gif === true`, Twitter/X `/tweet_video/`, Reddit GIFs), and short silent video clips (`<= GIF_MAX_DURATION_SECONDS`, default `6s`, with no audio stream).
+  - Generates full-resolution, high-fidelity `.gif` files using FFmpeg two-pass custom palette generation (`palettegen=stats_mode=full` + `paletteuse=dither=sierra2_4a`) capped at `GIF_MAX_FPS` (default `30` FPS).
+  - **Adaptive Discord Upload Fallback**: Uploads as a native auto-looping `.gif` when within `MAX_FILE_SIZE_MB`, or automatically switches to near-lossless `.mp4` (`CRF 18`) for Discord delivery when the `.gif` exceeds Discord's limit rather than sacrificing resolution or colors.
+  - **Dual-Format PC Preservation (`ARCHIVE_BOTH_FORMATS=true`)**: Saves both `.gif` and `.mp4` companion files side-by-side in `./archives` and records `companionFiles` in the `.json` metadata sidecar.
+- **Idempotent Local Archiver & Collision Deduplication (`src/archiver.js`, `tests/archiver.test.js`)**:
+  - Before appending a base-36 collision timestamp (`_<timestamp>`) when a file with the same title already exists in the target archive folder, `archiveLocalMedia()` checks existing `.json` sidecars (`mediaId`, `originalUrl`, `sha256`) and byte sizes to avoid creating redundant duplicate copies during rescans or `!reup`.
+  - Updates existing sidecar metadata in place and detects previously preserved collision files for distinct media sharing the same title.
+- **Instant Subprocess Termination & Abort Propagation for `/stop` (`src/utils.js`, `src/queue.js`, `src/mediaHandler.js`, `src/scanner.js`, `src/ytdlpDownloader.js`, `src/galleryDlDownloader.js`, `src/directDownloader.js`, `src/compress.js`, `src/thumbnailPreview.js`, `src/commands.js`, `src/index.js`, `tests/stopCommand.test.js`)**:
+  - End-to-end `AbortController` / `AbortSignal` support across the download queue, channel crawler, `yt-dlp`, `gallery-dl`, direct HTTP streams, FFmpeg compression, and thumbnail preview injection.
+  - Global download child process registry (`registerDownloadProcess`, `unregisterDownloadProcess`, `killAllDownloadProcesses`) and abortable `sleep(ms, signal)` helper immediately terminate active child process trees when `/stop` or `!stop` is invoked.
+  - Eagerly cleans up bot status reactions (`⏳`, `📥`, `🗜️`) and reports exact counts of aborted active downloads and cleared queue items.
+- **Archive Maintenance & Quality Upgrade CLI Suite (`scripts/`, `package.json`, `tests/convertArchiveToGif.test.js`)**:
+  - Added `npm run convert-gifs` (`scripts/convert_archive_to_gif.js`) to retroactively scan `./archives` for short silent videos and generate companion high-quality `.gif` files (`--dry-run`, `--channel`, `--max-duration`, `--fps`, `--force`).
+  - Added `npm run deduplicate` (`scripts/deduplicate_archive.js`) to clean up redundant duplicate files from historical filename collisions, merge sidecar metadata, back up and update `data/links.db`, and reclaim disk space (`--dry-run`, `--channel`).
+  - Added `npm run redownload-youtube` (`scripts/redownload_youtube.js`) to upgrade older low-resolution (`360p`) archived YouTube videos to `1080p`/`4K` with `-N 4` concurrent fragment acceleration.
+- **Web UI Port Conflict Detection & Expanded Test Suite (`src/web/server.js`, `tests/`)**:
+  - Gracefully detects when the Web UI is already running via the main bot instance (`EADDRINUSE` + `/api/health` check) and prints a helpful status message instead of crashing.
+  - Expanded native test suite from 69 to **94 unit and integration tests across 35 suites**.
 
 ### [v3.11.1] - 2026-09-26
 

@@ -173,7 +173,9 @@ async function downloadAndPostPlaylist(message, playlistInfo, options) {
     }
   } finally {
     activePlaylistJob = false;
-    await (targetChannel || message.channel).send(`✅ **Playlist Complete:** ${successCount} uploaded, ${failCount} failed or skipped.`).catch(() => {});
+    if (!isStopRequested()) {
+      await (targetChannel || message.channel).send(`✅ **Playlist Complete:** ${successCount} uploaded, ${failCount} failed or skipped.`).catch(() => {});
+    }
   }
   
   return { found: playlistInfo.entries.length, uploaded: successCount, failed: failCount };

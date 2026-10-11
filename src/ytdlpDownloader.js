@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { config } from './config.js';
 import { mergeOrphanedAudioVideo } from './streamMerge.js';
 import { getCookieForUrl } from './cookieVault.js';
-import { killProcessTree, getBrowserUserAgent } from './utils.js';
+import { killProcessTree, getBrowserUserAgent, registerDownloadProcess, unregisterDownloadProcess } from './utils.js';
 import { isAudioUrl, checkNsfwInMetadata } from './urlExtractor.js';
 
 const TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes (allows buffer for large downloads and rate-limits)
@@ -15,6 +15,10 @@ const TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes (allows buffer for large download
  * yt-dlp handles the size cap itself via --max-filesize.
  */
 export async function downloadWithYtDlp(url, destDir, options = {}) {
+  if (options?.signal?.aborted) {
+    throw new Error('DOWNLOAD_ABORTED');
+  }
+
   await fs.promises.mkdir(destDir, { recursive: true });
 
   // Cap at the hard cap here, not the target upload size: if the file comes
@@ -124,7 +128,7 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
     args.push('--cookies', cookiePath);
   }
 
-  await runProcess(config.ytdlpPath, args);
+  await runProcess(config.ytdlpPath, args, options?.signal);
 
   const files = await fs.promises.readdir(destDir);
   if (files.length === 0) {
@@ -135,7 +139,7 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
 
   // If media files exist, filter out any leftover loose thumbnail image files
   const mediaExtensions = new Set([
-    '.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4v',
+    '.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4v', '.gif',
     '.mp3', '.m4a', '.opus', '.ogg', '.flac', '.wav', '.aac', '.alac', '.aiff'
   ]);
   const mediaFiles = filePaths.filter((f) => mediaExtensions.has(path.extname(f).toLowerCase()));
@@ -147,8 +151,9 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
   const candidateFiles = mediaFiles.length > 0 ? mediaFiles : filePaths.filter((f) => !f.endsWith('.json'));
   const mergedMedia = await mergeOrphanedAudioVideo(candidateFiles, destDir);
 
-  // Check .info.json for NSFW / age restriction
+  // Check .info.json for NSFW / age restriction and GIF flags
   let isNsfw = false;
+  let isOriginalGif = false;
   const jsonFiles = filePaths.filter((f) => f.endsWith('.info.json') || f.endsWith('.json'));
   for (const jsonPath of jsonFiles) {
     try {
@@ -156,23 +161,46 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
       const parsed = JSON.parse(raw);
       if (checkNsfwInMetadata(parsed)) {
         isNsfw = true;
-        break;
+      }
+      if (
+        parsed.is_gif === true ||
+        (parsed.extractor_key === 'Twitter' && parsed.duration && parsed.duration <= 6 && (!parsed.acodec || parsed.acodec === 'none')) ||
+        (parsed.webpage_url && parsed.webpage_url.includes('/tweet_video/'))
+      ) {
+        isOriginalGif = true;
       }
     } catch {}
   }
 
-  return { mediaFiles: mergedMedia, subtitleFiles, isNsfw };
+  return { mediaFiles: mergedMedia, subtitleFiles, isNsfw, isOriginalGif };
 }
 
-function runProcess(cmd, args) {
+function runProcess(cmd, args, signal) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      return reject(new Error('DOWNLOAD_ABORTED'));
+    }
+
     const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    registerDownloadProcess(child);
     let stderr = '';
 
     const timer = setTimeout(() => {
+      unregisterDownloadProcess(child);
       killProcessTree(child);
       reject(new Error(`TIMEOUT: ${cmd} took too long`));
     }, TIMEOUT_MS);
+
+    const onAbort = () => {
+      clearTimeout(timer);
+      unregisterDownloadProcess(child);
+      killProcessTree(child);
+      reject(new Error('DOWNLOAD_ABORTED'));
+    };
+
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
 
     child.stderr.on('data', (chunk) => {
       stderr += chunk.toString();
@@ -180,6 +208,8 @@ function runProcess(cmd, args) {
 
     child.on('error', (err) => {
       clearTimeout(timer);
+      unregisterDownloadProcess(child);
+      if (signal) signal.removeEventListener('abort', onAbort);
       if (err.code === 'ENOENT') {
         reject(new Error(`COMMAND_NOT_FOUND: ${cmd} is not installed or not on PATH`));
       } else {
@@ -189,7 +219,11 @@ function runProcess(cmd, args) {
 
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (code === 0) {
+      unregisterDownloadProcess(child);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (signal?.aborted) {
+        reject(new Error('DOWNLOAD_ABORTED'));
+      } else if (code === 0) {
         resolve();
       } else {
         reject(new Error(`${cmd} exited with code ${code}: ${stderr.trim()}`));
@@ -198,16 +232,33 @@ function runProcess(cmd, args) {
   });
 }
 
-function runProcessWithStdout(cmd, args) {
+function runProcessWithStdout(cmd, args, signal) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      return reject(new Error('DOWNLOAD_ABORTED'));
+    }
+
     const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    registerDownloadProcess(child);
     let stdout = '';
     let stderr = '';
 
     const timer = setTimeout(() => {
+      unregisterDownloadProcess(child);
       killProcessTree(child);
       reject(new Error(`TIMEOUT: ${cmd} took too long`));
     }, 30000); // Shorter timeout for flat playlist extraction
+
+    const onAbort = () => {
+      clearTimeout(timer);
+      unregisterDownloadProcess(child);
+      killProcessTree(child);
+      reject(new Error('DOWNLOAD_ABORTED'));
+    };
+
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
 
     child.stdout.on('data', (chunk) => {
       stdout += chunk.toString();
@@ -219,6 +270,8 @@ function runProcessWithStdout(cmd, args) {
 
     child.on('error', (err) => {
       clearTimeout(timer);
+      unregisterDownloadProcess(child);
+      if (signal) signal.removeEventListener('abort', onAbort);
       if (err.code === 'ENOENT') {
         reject(new Error(`COMMAND_NOT_FOUND: ${cmd} is not installed or not on PATH`));
       } else {
@@ -228,7 +281,11 @@ function runProcessWithStdout(cmd, args) {
 
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (code === 0) {
+      unregisterDownloadProcess(child);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (signal?.aborted) {
+        reject(new Error('DOWNLOAD_ABORTED'));
+      } else if (code === 0) {
         resolve(stdout);
       } else {
         reject(new Error(`${cmd} exited with code ${code}: ${stderr.trim()}`));
@@ -240,7 +297,7 @@ function runProcessWithStdout(cmd, args) {
 /**
  * Extracts flat playlist metadata without downloading media.
  */
-export async function fetchFlatPlaylistInfo(url, maxItems = 25) {
+export async function fetchFlatPlaylistInfo(url, maxItems = 25, options = {}) {
   const args = [
     url,
     '--flat-playlist',
@@ -282,7 +339,7 @@ export async function fetchFlatPlaylistInfo(url, maxItems = 25) {
     args.push('--cookies', cookiePath);
   }
 
-  const output = await runProcessWithStdout(config.ytdlpPath, args);
+  const output = await runProcessWithStdout(config.ytdlpPath, args, options?.signal);
   try {
     return JSON.parse(output.trim());
   } catch (err) {

@@ -524,7 +524,23 @@ export async function startWebServer(port = config.webPort, host = config.webHos
 
 // Allow direct execution: `node src/web/server.js`
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename)) {
-  startWebServer().catch(() => {
+  startWebServer().catch(async (err) => {
+    if (err?.code === 'EADDRINUSE') {
+      try {
+        const testRes = await fetch(`http://127.0.0.1:${config.webPort}/api/status`, {
+          signal: AbortSignal.timeout(1500),
+        });
+        if (testRes.ok) {
+          const data = await testRes.json();
+          if (data?.ok) {
+            console.log(`\n[Web UI] ℹ️ Archivist Fox Web UI is ALREADY running at http://localhost:${config.webPort}`);
+            console.log(`[Web UI] 💡 It was launched automatically in the background by your running bot instance (ENABLE_WEB_UI=true).`);
+            console.log(`[Web UI] You can open http://localhost:${config.webPort} directly in your browser without running run_web.bat.\n`);
+            process.exit(0);
+          }
+        }
+      } catch {}
+    }
     process.exit(1);
   });
 }
