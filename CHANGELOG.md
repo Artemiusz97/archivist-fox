@@ -23,6 +23,7 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 
 | Version | Release Date | Type | Primary Milestone / Theme |
 | :--- | :--- | :--- | :--- |
+| **[v3.13.0](#v3130---2026-11-03)** | 2026-11-03 | Minor | User Attachment Auto-Archiving, YouTube Resolution & Premium Bitrate Upgrade Engine, Web UI Range Streaming & Auth Security, O(1) SQLite Disk Telemetry, SWAR Popcount dHash Matching, and 173-Test Native Suite. |
 | **[v3.12.0](#v3120---2026-10-11)** | 2026-10-11 | Minor | Dual-Format High-Quality GIF Pipeline, Idempotent Local Archiver, Instant `/stop` Subprocess Termination, Archive Maintenance CLI Suite (`convert-gifs`, `deduplicate`, `redownload-youtube`), and 94-Test Native Suite. |
 | **[v3.11.1](#v3111---2026-09-26)** | 2026-09-26 | Patch | Link Backup Decoupling, Enhanced Crawler Telemetry, Privacy Hardening & Discord.js v14 Modernization. |
 | **[v3.11.0](#v3110---2026-09-24)** | 2026-09-24 | Minor | Link Backup & Disaster Recovery Suite: Multi-format link exporter (JSON, Markdown, CSV), automated link restoration & reposting engine (`/restore`, `!restore`, CLI), message context preservation, channel slug normalization, and comprehensive 69-test native suite. |
@@ -53,6 +54,34 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 ---
 
 ## Release Details
+
+### [v3.13.0] - 2026-11-03
+
+#### Added & Improved
+- **User Message Attachment Auto-Archiving (`ARCHIVE_USER_ATTACHMENTS=true`) (`src/urlExtractor.js`, `src/mediaHandler.js`, `src/scanner.js`, `src/config.js`, `.env.example`)**:
+  - Automatically detects, downloads, and archives media files (images, videos, audio, GIFs) manually attached or uploaded by users directly in chat across allowed channels.
+  - Generates structured `.json` metadata sidecars (`uploader`, `channel`, `timestamp`, `sha256`) and SQLite records, preserving native attachments permanently even if the user deletes their message or leaves the server.
+- **YouTube Highest Resolution & Premium Bitrate Upgrade Engine (`src/youtubeUpgrader.js`, `scripts/redownload_youtube.js`)**:
+  - Standalone modular upgrade engine evaluating video height, framerate, video codec, audio codec, and bitrate gains with a configurable minimum % threshold (`--min-bitrate-gain`, default 5%).
+  - Supports YouTube Premium 1080p Enhanced Bitrate and 256kbps Opus audio streams using browser cookies (`--cookies-from-browser`, `-C <browser>`).
+  - Added parallel metadata inspection (`--concurrency <N>`, default 5), concurrent fragment acceleration (`-N 4`), atomic staging, dry-run auditing (`--dry-run`), and optional pre-replacement backups (`--backup`).
+- **Web UI Range Streaming, Host Containment & Token Authentication (`src/web/server.js`, `src/web/public/app.js`, `src/web/public/index.html`)**:
+  - RFC 7233 partial content range requests (`HTTP 206`) enabling smooth seek and scrub media playback directly in web browsers.
+  - Path traversal containment via `fs.promises.realpath` preventing `..`, `.env`, symlinks, and sibling-prefix escapes.
+  - Configurable `WEB_AUTH_TOKEN` security via `X-Auth-Token` header, `Authorization: Bearer`, or URL parameter `?token=`.
+  - Host directory opening restricted exclusively to loopback clients (`127.0.0.1` / `::1`).
+  - SSE connection teardown upon task terminal stages and bounded in-memory task caching (`MAX_TASKS = 200`).
+- **Performance, Subprocess & Network Hardening (`src/db.js`, `src/linkDb.js`, `src/phasher.js`, `src/utils.js`)**:
+  - $O(1)$ SQLite disk size calculation via `SUM(file_size)` with 60-second caching, eliminating blocking multi-gigabyte disk walks during `/status` and `/stats`.
+  - High-throughput transactional batch writes (`saveRecordBatch`, `saveLinkRecordBatch`) for crawls and startup catch-up scans.
+  - SWAR bitwise popcount parallel arithmetic in `singleHammingDistance` for lightning-fast perceptual dHash comparison.
+  - Unified subprocess gateway (`runProcess`) with continuous stdout/stderr draining (preventing 64 KB Windows pipe deadlocks) and 2MB rolling buffers.
+  - DNS-level SSRF defense (`validateSsrfTarget`) blocking requests targeting private, loopback, or carrier-grade NAT IPs.
+  - Anti-rate-limit domain request pacing (staggering requests by 600ms–1100ms per hostname).
+  - Clears stale guild-scoped application commands upon startup to prevent duplicate slash commands appearing in Discord.
+- **Expanded Test Suite (`tests/`, `package.json`)**:
+  - Expanded native test suite from 94 to **173 unit and integration tests across 77 suites** with 100% pass rate.
+  - Added clean-room verification suites covering database re-initialization, cookie vault precedence, SSRF defense, Web UI Range streaming, duplicate alerts, NSFW metadata recursion, YouTube quality upgrading, and crawler concurrency.
 
 ### [v3.12.0] - 2026-10-11
 

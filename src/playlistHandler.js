@@ -1,9 +1,14 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, ChannelType, MessageFlags } from 'discord.js';
 import { config } from './config.js';
 import { fetchFlatPlaylistInfo } from './ytdlpDownloader.js';
-import { handleMessage } from './mediaHandler.js';
-import { isStopRequested, clearStopRequested } from './scanner.js';
-import { scheduleAutoDelete, getHumanJitterMs } from './utils.js';
+import {
+  isStopRequested,
+  clearStopRequested,
+  scheduleAutoDelete,
+  getHumanJitterMs,
+  isModeratorOrOwner,
+  sleep,
+} from './utils.js';
 
 let activePlaylistJob = false;
 
@@ -11,7 +16,7 @@ export function isPlaylistDownloading() {
   return activePlaylistJob;
 }
 
-export async function handlePlaylistPromptAndDownload(message, rawUrl, details, options) {
+export async function handlePlaylistPromptAndDownload(message, rawUrl, details, options = {}, runMessageFn) {
   let playlistInfo = null;
   let loadingMsg = null;
 
@@ -37,8 +42,8 @@ export async function handlePlaylistPromptAndDownload(message, rawUrl, details, 
       scheduleAutoDelete(loadingMsg, 5000);
     }
     // Fallback to single video download if applicable, else exit
-    if (details.isVideoWithPlaylist) {
-      return await handleMessage(message, { ...options, ignorePlaylists: true });
+    if (details.isVideoWithPlaylist && typeof runMessageFn === 'function') {
+      return await runMessageFn(message, { ...options, ignorePlaylists: true });
     }
     return { found: 0, uploaded: 0, failed: 1 };
   }
@@ -78,7 +83,7 @@ export async function handlePlaylistPromptAndDownload(message, rawUrl, details, 
     const confirmation = await promptMsg.awaitMessageComponent({
       filter: (i) => {
         const isAuthor = i.user.id === message.author.id;
-        const isMod = i.memberPermissions?.has(8n) || i.memberPermissions?.has(8192n); // Admin or Manage Messages
+        const isMod = isModeratorOrOwner(i.memberPermissions, message.guild, i.user.id);
         if (isAuthor || isMod) return true;
         i.reply({ content: '❌ Only the person who posted this link or a moderator can make this choice.', flags: MessageFlags.Ephemeral }).catch(() => {});
         return false;
@@ -90,10 +95,10 @@ export async function handlePlaylistPromptAndDownload(message, rawUrl, details, 
     if (confirmation.customId === `pl_vid_${sessionId}`) {
       await confirmation.update({ content: '🎬 Downloading single video...', components: [] }).catch(() => {});
       scheduleAutoDelete(promptMsg, 3000);
-      return await handleMessage(message, { ...options, ignorePlaylists: true });
+      return await runMessageFn(message, { ...options, ignorePlaylists: true });
     } else if (confirmation.customId === `pl_all_${sessionId}`) {
       await confirmation.update({ content: `📁 Starting playlist download: **"${title}"** (${count} videos)...`, components: [] }).catch(() => {});
-      return await downloadAndPostPlaylist(message, playlistInfo, options);
+      return await downloadAndPostPlaylist(message, playlistInfo, options, runMessageFn);
     } else {
       await confirmation.update({ content: '❌ Playlist download cancelled.', components: [] }).catch(() => {});
       scheduleAutoDelete(promptMsg, 5000);
@@ -101,10 +106,10 @@ export async function handlePlaylistPromptAndDownload(message, rawUrl, details, 
     }
   } catch (err) {
     // Timeout
-    if (details.isVideoWithPlaylist) {
+    if (details.isVideoWithPlaylist && typeof runMessageFn === 'function') {
       await promptMsg.edit({ content: '⏳ No selection made. Defaulting to downloading this video only...', components: [] }).catch(() => {});
       scheduleAutoDelete(promptMsg, 3000);
-      return await handleMessage(message, { ...options, ignorePlaylists: true });
+      return await runMessageFn(message, { ...options, ignorePlaylists: true });
     } else {
       await promptMsg.edit({ content: '⏳ Playlist confirmation timed out.', components: [] }).catch(() => {});
       scheduleAutoDelete(promptMsg, 5000);
@@ -113,7 +118,7 @@ export async function handlePlaylistPromptAndDownload(message, rawUrl, details, 
   }
 }
 
-async function downloadAndPostPlaylist(message, playlistInfo, options) {
+async function downloadAndPostPlaylist(message, playlistInfo, options, runMessageFn) {
   activePlaylistJob = true;
   clearStopRequested();
   let targetChannel = null;
@@ -154,7 +159,12 @@ async function downloadAndPostPlaylist(message, playlistInfo, options) {
       mockMessage.reply = (opts) => (targetChannel || message.channel).send(opts);
 
       try {
-        const result = await handleMessage(mockMessage, { ...options, ignorePlaylists: true, overrideChannel: targetChannel });
+        const result = await runMessageFn(mockMessage, {
+          ...options,
+          ignorePlaylists: true,
+          overrideChannel: targetChannel,
+          sleepRequests: '0.75',
+        });
         
         if (result && result.uploaded > 0) {
           successCount += result.uploaded;
@@ -168,7 +178,7 @@ async function downloadAndPostPlaylist(message, playlistInfo, options) {
 
       if (index < playlistInfo.entries.length - 1 && !isStopRequested()) {
         const jitter = getHumanJitterMs(1500, 3000);
-        await new Promise(r => setTimeout(r, jitter));
+        await sleep(jitter);
       }
     }
   } finally {

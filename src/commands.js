@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import {
   SlashCommandBuilder,
   ContextMenuCommandBuilder,
@@ -12,31 +11,32 @@ import {
   MessageFlags,
 } from 'discord.js';
 import { config, isChannelAllowed, isLinkBackupChannel } from './config.js';
-import { getDb, getDistinctLinkChannels } from './linkDb.js';
+import { getDb, getDistinctLinkChannels, deleteLinksByMessageId } from './linkDb.js';
+import { getTotalArchiveSize } from './db.js';
 import { getBestVideoEncoder } from './compress.js';
 import { handleMessage } from './mediaHandler.js';
 import { downloadQueue } from './queue.js';
-import { crawlChannel, isScanRunning, setScanRunning, stopActiveTasks, isStopRequested } from './scanner.js';
+import { crawlChannel, isScanRunning, setScanRunning, stopActiveTasks, isStopRequested, formatStopSummary } from './scanner.js';
 import { exportLinks } from './linkExporter.js';
 import { restoreLinks, isRestoreRunning } from './linkRestorer.js';
+import { runProcess, isModeratorOrOwner, PYTHON_BIN } from './utils.js';
 
-function runCmdOutput(cmd, args) {
-  return new Promise((resolve) => {
-    try {
-      const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-      let out = '';
-      child.stdout.on('data', (d) => (out += d.toString()));
-      child.stderr.on('data', (d) => (out += d.toString()));
-      child.on('error', () => resolve('Not found'));
-      child.on('close', (code) => resolve(code === 0 ? out.trim() : 'Error'));
-    } catch {
-      resolve('Error');
-    }
-  });
+async function runCmdOutput(cmd, args) {
+  try {
+    const { code, stdout, stderr } = await runProcess(cmd, args, {
+      timeoutMs: 15000,
+      registerProcess: false,
+      rejectOnNonZero: false,
+    });
+    const out = `${stdout}\n${stderr}`.trim();
+    return code === 0 ? out : 'Error';
+  } catch (err) {
+    return err?.message?.startsWith('COMMAND_NOT_FOUND') ? 'Not found' : 'Error';
+  }
 }
 
 function formatBytes(bytes) {
-  if (bytes === 0) return '0 B';
+  if (!bytes || bytes === 0) return '0 B';
   const k = 1024;
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
@@ -59,31 +59,6 @@ function formatUptime(seconds) {
   if (m > 0) parts.push(`${m}m`);
   parts.push(`${s}s`);
   return parts.join(' ');
-}
-
-async function getDirectorySize(dirPath) {
-  let total = 0;
-  if (!fs.existsSync(dirPath)) return 0;
-
-  async function walk(dir) {
-    try {
-      const entries = await fs.promises.readdir(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          await walk(full);
-        } else if (entry.isFile()) {
-          try {
-            const stat = await fs.promises.stat(full);
-            total += stat.size;
-          } catch {}
-        }
-      }
-    } catch {}
-  }
-
-  await walk(dirPath);
-  return total;
 }
 
 /**
@@ -233,14 +208,22 @@ export async function registerCommands(client) {
     console.log(`[Commands] Registering ${commands.length} application commands...`);
 
     if (client.application) {
-      await client.application.commands.set(commands);
-      
-      // Also register directly to existing guilds for instant zero-delay availability
-      const guilds = Array.from(client.guilds.cache.values());
-      for (const guild of guilds) {
-        await guild.commands.set(commands).catch(() => {});
+      const devGuildId = process.env.DEV_GUILD_ID?.trim();
+      if (devGuildId) {
+        const devGuild = client.guilds.cache.get(devGuildId);
+        if (devGuild) {
+          await devGuild.commands.set(commands).catch(() => {});
+          console.log(`[Commands] Registered ${commands.length} commands to DEV_GUILD_ID (${devGuildId}).`);
+        }
+      } else {
+        await client.application.commands.set(commands);
+        // Clear any stale duplicate guild-scoped commands so slash commands never appear twice
+        const guilds = Array.from(client.guilds.cache.values());
+        for (const guild of guilds) {
+          await guild.commands.set([]).catch(() => {});
+        }
+        console.log(`[Commands] Successfully registered application commands globally (cleared ${guilds.length} guild command cache(s))!`);
       }
-      console.log(`[Commands] Successfully registered application commands globally & to ${guilds.length} active guild(s)!`);
     }
   } catch (err) {
     console.error('[Commands] Failed to register application commands:', err);
@@ -353,10 +336,7 @@ export async function handleInteraction(interaction) {
       if (interaction.customId.startsWith('dismiss_alert:')) {
         const authorId = interaction.customId.split(':')[1];
         const isAuthor = interaction.user.id === authorId;
-        const isMod =
-          interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages) ||
-          interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
-          interaction.guild?.ownerId === interaction.user.id;
+        const isMod = isModeratorOrOwner(interaction.memberPermissions, interaction.guild, interaction.user.id);
 
         if (isAuthor || isMod) {
           await interaction.deferUpdate().catch(() => {});
@@ -373,10 +353,7 @@ export async function handleInteraction(interaction) {
       if (interaction.customId.startsWith('delete_duplicate:')) {
         const [, targetMessageId, authorId] = interaction.customId.split(':');
         const isAuthor = interaction.user.id === authorId;
-        const isMod =
-          interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages) ||
-          interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
-          interaction.guild?.ownerId === interaction.user.id;
+        const isMod = isModeratorOrOwner(interaction.memberPermissions, interaction.guild, interaction.user.id);
 
         if (!isAuthor && !isMod) {
           await interaction.reply({
@@ -401,12 +378,13 @@ export async function handleInteraction(interaction) {
 
         await interaction.deferUpdate().catch(() => {});
 
-        // Fetch and delete the duplicate message
+        // Fetch and delete the duplicate message, and clean up any indexed link rows for it
         try {
           const targetMessage = await interaction.channel.messages.fetch(targetMessageId).catch(() => null);
           if (targetMessage) {
             await targetMessage.delete().catch(() => {});
           }
+          deleteLinksByMessageId(targetMessageId);
         } catch (err) {
           console.error('[Commands] Failed to delete duplicate message:', err);
         }
@@ -439,10 +417,11 @@ export async function handleInteraction(interaction) {
         try {
           const result = await handleMessage(targetMessage, { notifyIfEmpty: true, force: true });
           if (result.found === 0) {
-            await interaction.editReply({ content: 'ℹ️ No supported media links found in that message.' });
+            await interaction.editReply({ content: 'ℹ️ No supported media links or attachments found in that message.' });
           } else {
+            const archivedInfo = result.archived ? `, archived ${result.archived} file(s)` : '';
             await interaction.editReply({
-              content: `✅ Done! Found ${result.found} media link(s), uploaded ${result.uploaded} attachment(s).`,
+              content: `✅ Done! Found ${result.found} media item(s)${archivedInfo}, uploaded ${result.uploaded} attachment(s).`,
             });
           }
         } catch (err) {
@@ -468,10 +447,10 @@ export async function handleInteraction(interaction) {
         const [ytdlpVer, gallerydlVer, gpuEncoder, archiveBytes] = await Promise.all([
           runCmdOutput(config.ytdlpPath, ['--version']),
           config.usePythonGalleryDl
-            ? runCmdOutput('python3', ['-m', 'gallery_dl', '--version'])
+            ? runCmdOutput(PYTHON_BIN, ['-m', 'gallery_dl', '--version'])
             : runCmdOutput(config.gallerydlPath, ['--version']),
           getBestVideoEncoder(),
-          getDirectorySize(path.resolve(config.archiveDirectory)),
+          getTotalArchiveSize(),
         ]);
 
         const db = getDb();
@@ -601,7 +580,7 @@ export async function handleInteraction(interaction) {
           console.error('[Commands] Stats query error:', err);
         }
 
-        const archiveBytes = await getDirectorySize(path.resolve(config.archiveDirectory));
+        const archiveBytes = await getTotalArchiveSize();
 
         const channelLines =
           topChannels.length > 0
@@ -645,10 +624,7 @@ export async function handleInteraction(interaction) {
       }
 
       if (commandName === 'rescan') {
-        const isMod =
-          interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages) ||
-          interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
-          interaction.guild?.ownerId === interaction.user.id;
+        const isMod = isModeratorOrOwner(interaction.memberPermissions, interaction.guild, interaction.user.id);
 
         if (!isMod) {
           await interaction.reply({
@@ -746,10 +722,7 @@ export async function handleInteraction(interaction) {
       }
 
       if (commandName === 'export-links') {
-        const isMod =
-          interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages) ||
-          interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
-          interaction.guild?.ownerId === interaction.user.id;
+        const isMod = isModeratorOrOwner(interaction.memberPermissions, interaction.guild, interaction.user.id);
 
         if (!isMod) {
           await interaction.reply({
@@ -938,10 +911,7 @@ export async function handleInteraction(interaction) {
       }
 
       if (commandName === 'stop') {
-        const isMod =
-          interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages) ||
-          interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
-          interaction.guild?.ownerId === interaction.user.id;
+        const isMod = isModeratorOrOwner(interaction.memberPermissions, interaction.guild, interaction.user.id);
 
         if (!isMod) {
           await interaction.reply({
@@ -951,18 +921,12 @@ export async function handleInteraction(interaction) {
           return;
         }
 
-        const stopped = stopActiveTasks();
-        if (stopped.scanRunning || stopped.playlistRunning || stopped.restoreRunning || stopped.queueItemsCleared > 0 || stopped.activeDownloadsStopped > 0) {
-          let msg = '🛑 **Stopped active tasks:**\n';
-          if (stopped.scanRunning) msg += '• Aborted active channel rescan / media crawl.\n';
-          if (stopped.restoreRunning) msg += '• Aborted active link restoration / reposting.\n';
-          if (stopped.playlistRunning) msg += '• Aborted active playlist download.\n';
-          if (stopped.activeDownloadsStopped > 0) msg += `• Aborted **${stopped.activeDownloadsStopped}** download(s) in progress.\n`;
-          if (stopped.queueItemsCleared > 0) msg += `• Cleared **${stopped.queueItemsCleared}** queued download(s).\n`;
-          await interaction.reply({ content: msg });
+        const summary = formatStopSummary(stopActiveTasks());
+        if (summary.hasActiveTasks) {
+          await interaction.reply({ content: summary.message });
         } else {
           await interaction.reply({
-            content: 'ℹ️ No active downloads, rescan, playlist download, restoration, or queued tasks are currently running.',
+            content: summary.message,
             flags: MessageFlags.Ephemeral,
           });
         }
@@ -973,6 +937,13 @@ export async function handleInteraction(interaction) {
     console.error('[Commands] Interaction error:', err);
     if (interaction.deferred && !interaction.replied) {
       await interaction.editReply({ content: '❌ An error occurred while executing this command.' }).catch(() => {});
+    } else if (!interaction.replied && !interaction.deferred) {
+      await interaction
+        .reply({
+          content: '❌ An error occurred while executing this command.',
+          flags: MessageFlags.Ephemeral,
+        })
+        .catch(() => {});
     }
   }
 }

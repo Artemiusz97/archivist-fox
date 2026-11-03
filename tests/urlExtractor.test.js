@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   extractMediaLinks,
+  extractMediaLinksAsync,
   isKnownNsfwUrl,
   checkNsfwInMetadata,
   normalizeUrl,
@@ -52,6 +53,30 @@ describe('urlExtractor', () => {
       assert.strictEqual(ranges.length, 2);
       assert.strictEqual(text.slice(ranges[0].start, ranges[0].end), '||inside||');
       assert.strictEqual(text.slice(ranges[1].start, ranges[1].end), '||second||');
+    });
+
+    it('strips trailing backslashes, markdown delimiters, and angle brackets from extracted links', async () => {
+      const text =
+        'Look: https://x.com/Dev_Voxy/status/2116421485594382571\\ and https://x.com/Dev_Voxy/status/9999\\: and `https://x.com/Dev_Voxy/status/1111` and *https://x.com/Dev_Voxy/status/2222* and ~~https://x.com/Dev_Voxy/status/3333~~';
+      const links = extractMediaLinks(text);
+      assert.strictEqual(links.length, 5);
+      assert.strictEqual(links[0].url, 'https://x.com/Dev_Voxy/status/2116421485594382571');
+      assert.strictEqual(links[1].url, 'https://x.com/Dev_Voxy/status/9999');
+      assert.strictEqual(links[2].url, 'https://x.com/Dev_Voxy/status/1111');
+      assert.strictEqual(links[3].url, 'https://x.com/Dev_Voxy/status/2222');
+      assert.strictEqual(links[4].url, 'https://x.com/Dev_Voxy/status/3333');
+
+      const asyncLinks = await extractMediaLinksAsync('Async: https://x.com/Dev_Voxy/status/2116421485594382571\\');
+      assert.strictEqual(asyncLinks.length, 1);
+      assert.strictEqual(asyncLinks[0].url, 'https://x.com/Dev_Voxy/status/2116421485594382571');
+    });
+
+    it('preserves exact query parameter order and casing on direct signed CDN URLs', () => {
+      const signedCdnUrl = 'https://cdn.example.com/asset.mp4?Expires=1700000000&Signature=kX91aZbC&Key-Pair-Id=K12345';
+      const links = extractMediaLinks(signedCdnUrl);
+      assert.strictEqual(links.length, 1);
+      assert.strictEqual(links[0].type, 'direct');
+      assert.strictEqual(links[0].url, signedCdnUrl);
     });
   });
 
@@ -189,6 +214,37 @@ describe('urlExtractor', () => {
         '(https://example.com/page'
       );
     });
+
+    it('strips trailing backslashes, markdown delimiters, and angle brackets while preserving mid-URL ~ and *', () => {
+      assert.strictEqual(
+        stripQueryAndTrailingPunctuation('https://x.com/Dev_Voxy/status/2116421485594382571\\'),
+        'https://x.com/Dev_Voxy/status/2116421485594382571'
+      );
+      assert.strictEqual(
+        stripQueryAndTrailingPunctuation('https://x.com/Dev_Voxy/status/2116421485594382571\\:'),
+        'https://x.com/Dev_Voxy/status/2116421485594382571'
+      );
+      assert.strictEqual(
+        stripQueryAndTrailingPunctuation('https://x.com/user/status/123*'),
+        'https://x.com/user/status/123'
+      );
+      assert.strictEqual(
+        stripQueryAndTrailingPunctuation('https://x.com/user/status/123~'),
+        'https://x.com/user/status/123'
+      );
+      assert.strictEqual(
+        stripQueryAndTrailingPunctuation('https://x.com/user/status/123`'),
+        'https://x.com/user/status/123'
+      );
+      assert.strictEqual(
+        stripQueryAndTrailingPunctuation('https://x.com/user/status/123>'),
+        'https://x.com/user/status/123'
+      );
+      assert.strictEqual(
+        stripQueryAndTrailingPunctuation('https://example.com/~user/page*123*'),
+        'https://example.com/~user/page*123'
+      );
+    });
   });
 
   describe('Audio & DeviantArt Helpers', () => {
@@ -243,6 +299,16 @@ describe('urlExtractor', () => {
       assert.ok(res);
       assert.strictEqual(res.isPlaylist, false);
       assert.strictEqual(res.listId, null);
+    });
+
+    it('sanitizes trailing backslashes and markdown delimiters from playlist URLs', () => {
+      const resBackslash = extractYouTubePlaylistDetails('https://www.youtube.com/playlist?list=PLabc456\\');
+      assert.strictEqual(resBackslash.isPlaylist, true);
+      assert.strictEqual(resBackslash.listId, 'PLabc456');
+
+      const resBacktick = extractYouTubePlaylistDetails('https://www.youtube.com/playlist?list=PLabc456`');
+      assert.strictEqual(resBacktick.isPlaylist, true);
+      assert.strictEqual(resBacktick.listId, 'PLabc456');
     });
   });
 });

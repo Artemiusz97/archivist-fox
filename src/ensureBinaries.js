@@ -1,33 +1,32 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { config } from './config.js';
+import { runProcess, PYTHON_BIN } from './utils.js';
 
-function runCmd(cmd, args) {
-  return new Promise((resolve) => {
-    try {
-      const proc = spawn(cmd, args, { stdio: ['ignore', 'ignore', 'ignore'] });
-      proc.on('error', () => resolve(false));
-      proc.on('close', (code) => resolve(code === 0));
-    } catch {
-      resolve(false);
-    }
-  });
+async function runCmd(cmd, args, timeoutMs = 30000) {
+  try {
+    const { code } = await runProcess(cmd, args, {
+      timeoutMs,
+      registerProcess: false,
+      rejectOnNonZero: false,
+    });
+    return code === 0;
+  } catch {
+    return false;
+  }
 }
 
-function runCmdWithOutput(cmd, args) {
-  return new Promise((resolve) => {
-    try {
-      const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-      let output = '';
-      proc.stdout.on('data', (d) => { output += d.toString(); });
-      proc.stderr.on('data', (d) => { output += d.toString(); });
-      proc.on('error', () => resolve({ code: -1, output: '' }));
-      proc.on('close', (code) => resolve({ code, output }));
-    } catch {
-      resolve({ code: -1, output: '' });
-    }
-  });
+async function runCmdWithOutput(cmd, args, timeoutMs = 30000) {
+  try {
+    const { code, stdout, stderr } = await runProcess(cmd, args, {
+      timeoutMs,
+      registerProcess: false,
+      rejectOnNonZero: false,
+    });
+    return { code, output: `${stdout}\n${stderr}`.trim() };
+  } catch {
+    return { code: -1, output: '' };
+  }
 }
 
 async function isBinaryWorking(binPath, versionArg = '--version') {
@@ -41,7 +40,7 @@ async function isBinaryWorking(binPath, versionArg = '--version') {
 
 async function downloadFile(url, destPath) {
   console.log(`Downloading required binary from ${url}...`);
-  const res = await fetch(url, { redirect: 'follow' });
+  const res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(60000) });
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} ${res.statusText}`);
   }
@@ -56,7 +55,9 @@ async function downloadFile(url, destPath) {
 
 async function getGalleryDlDownloadUrl() {
   try {
-    const res = await fetch('https://codeberg.org/api/v1/repos/mikf/gallery-dl/releases/latest');
+    const res = await fetch('https://codeberg.org/api/v1/repos/mikf/gallery-dl/releases/latest', {
+      signal: AbortSignal.timeout(15000),
+    });
     if (res.ok) {
       const data = await res.json();
       const filename = process.platform === 'win32' ? 'gallery-dl.exe' : 'gallery-dl.bin';
@@ -102,18 +103,18 @@ async function handleGalleryDlSetup(cwd) {
     }
   }
 
-  // 3. Fallback: check if python3 has gallery_dl module installed
-  if (await runCmd('python3', ['-m', 'gallery_dl', '--version'])) {
-    console.log('Detected working Python module gallery_dl. Switching gallery-dl execution mode to python3.');
+  // 3. Fallback: check if Python has gallery_dl module installed
+  if (await runCmd(PYTHON_BIN, ['-m', 'gallery_dl', '--version'])) {
+    console.log(`Detected working Python module gallery_dl. Switching gallery-dl execution mode to ${PYTHON_BIN}.`);
     config.usePythonGalleryDl = true;
     return;
   }
 
-  // 4. Try installing gallery-dl via pip if python3 is available
-  if (await runCmd('python3', ['--version'])) {
-    console.log('Attempting to install gallery-dl via pip (python3 -m pip install gallery-dl)...');
-    const pipSuccess = await runCmd('python3', ['-m', 'pip', 'install', '-U', 'gallery-dl']);
-    if (pipSuccess && (await runCmd('python3', ['-m', 'gallery_dl', '--version']))) {
+  // 4. Try installing gallery-dl via pip if Python is available
+  if (await runCmd(PYTHON_BIN, ['--version'])) {
+    console.log(`Attempting to install gallery-dl via pip (${PYTHON_BIN} -m pip install gallery-dl)...`);
+    const pipSuccess = await runCmd(PYTHON_BIN, ['-m', 'pip', 'install', '-U', 'gallery-dl'], 90000);
+    if (pipSuccess && (await runCmd(PYTHON_BIN, ['-m', 'gallery_dl', '--version']))) {
       console.log('Successfully installed gallery-dl via pip!');
       config.usePythonGalleryDl = true;
       return;

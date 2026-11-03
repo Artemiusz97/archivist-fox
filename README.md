@@ -8,6 +8,35 @@ links (`.jpg`, `.mp4`, `.mp3`, etc.), social platform posts & art galleries
 tracks (SoundCloud, Bandcamp, Mixcloud, Audiomack, YouTube Music) — downloads
 the media, and replies to the original poster with it as a file attachment.
 
+## 🦊 Unique & Standout Features
+
+Archivist Fox is designed not just as a link re-uploader, but as an autonomous, high-fidelity media archivist and disaster recovery system for Discord communities:
+
+- **Cascading 4-Tier Perceptual Deduplication Engine**:
+  - Eliminates redundant downloads and Discord repost clutter using a cascading multi-factor filter: **Tier 1** Canonical Platform Media ID $\rightarrow$ **Tier 2** Cryptographic SHA-256 byte digest $\rightarrow$ **Tier 3** Video duration gating (rejects mismatches $> 1.5$s) $\rightarrow$ **Tier 4** Multi-frame perceptual visual hashing (dHash) powered by SWAR bitwise parallel popcount arithmetic with flat-hash rejection.
+- **Permanent Local PC Archiving & User Attachment Backup**:
+  - Automatically saves full-fidelity uncompressed media to your local PC or NAS with structured subfolders (`channel/date`, `date/channel`, or `channel`) and comprehensive `.json` metadata sidecars.
+  - **User Message Attachment Archiving (`ARCHIVE_USER_ATTACHMENTS=true`)**: Automatically backs up media files manually attached or uploaded by users directly in chat—preserving photos, videos, and art even if the user later deletes their message.
+  - **Idempotent Storage Engine**: Pre-copy identity verification avoids duplicate copies during historical rescans or forced re-uploads.
+- **Dual-Format High-Fidelity GIF Pipeline**:
+  - Solves the modern web dilemma where Twitter/Reddit "GIFs" are silent MP4s: generates full-resolution, high-fidelity `.gif` files using FFmpeg two-pass custom palette generation (`sierra2_4a`).
+  - **Adaptive Discord Fallback**: Uploads as a native looping `.gif` when within your server's upload limit, or seamlessly falls back to crisp `.mp4` for Discord delivery while keeping **both** formats in your local archive.
+- **YouTube 4K, 8K & Premium Bitrate Upgrade Engine**:
+  - Built-in upgrade utility (`npm run redownload-youtube` / `src/youtubeUpgrader.js`) to retroactively audit and re-download archived YouTube videos in maximum resolution (4K/8K) or YouTube Premium 1080p Enhanced Bitrate with concurrent fragment acceleration (`-N 4`) and direct browser cookie extraction.
+- **Instant Subprocess Abortion (`/stop` & `!stop`)**:
+  - Deep `AbortController` / `AbortSignal` propagation terminates active downloader subprocess trees (`taskkill` on Windows, process group `SIGKILL` on POSIX) immediately—halting active `yt-dlp`, `gallery-dl`, HTTP streams, and FFmpeg tasks without waiting for timeouts.
+- **Self-Hosted Web Dashboard & Direct Downloader**:
+  - Browser-based control center (`http://localhost:3000`) featuring live Server-Sent Events (SSE) download progress, media player with RFC 7233 partial content range streaming (`HTTP 206`), Windows File Explorer shortcuts, path traversal security containment, and optional `WEB_AUTH_TOKEN` authentication.
+- **Link Backup & Channel Disaster Recovery Suite**:
+  - Export server links into structured Master JSON, per-channel JSON, formatted Markdown tables, or CSV spreadsheets (`/export-links`).
+  - Automated channel link restoration (`/restore` or `!restore`) that reposts links sequentially with rate-limit safe pacing, original author attribution, and automatic channel recreation if channels were accidentally deleted.
+- **Anti-Bot & Rate-Limit Hardening**:
+  - Browser fingerprint impersonation (`chrome`, `firefox`, `safari`), human reaction jitter delays (1.5s–3.5s), automated domain request pacing (600ms–1100ms), and DNS-level SSRF defense.
+- **Automated Offline Catch-Up & Crawler**:
+  - Automatically crawls messages posted while your PC was offline upon bot startup (`AUTO_SCAN_ON_STARTUP=true`), and provides interactive server-wide historical crawling (`/rescan`).
+- **Zero-Dependency Native Verification Suite**:
+  - Fully covered by **173 native unit and integration tests across 77 suites** with zero third-party test dependencies.
+
 ## How it works
 
 1. On every message, the bot scans for URLs.
@@ -86,6 +115,7 @@ the media, and replies to the original poster with it as a file attachment.
 | `GIF_MAX_FPS` | `30` | Maximum framerate for generated GIFs (`10` to `50`, default `30`) |
 | `ARCHIVE_BOTH_FORMATS` | `true` | Preserve both `.gif` and `.mp4` companion files in the local PC archive |
 | `ENABLE_LOCAL_ARCHIVE` | `true` | Permanently save full-quality uncompressed media to your local PC |
+| `ARCHIVE_USER_ATTACHMENTS` | `true` | Also back up media files manually uploaded/attached by users in allowed channels |
 | `ARCHIVE_DIRECTORY` | `./archives` | Folder path on your PC where original files are preserved |
 | `ARCHIVE_SAVE_METADATA` | `true` | Save a matching `.json` metadata file (URL, author, channel, date) alongside media |
 | `ENABLE_DUPLICATE_PREVENTION` | `true` | Detect visual duplicates, prevent redundant downloads, and send auto-deleting notices |
@@ -100,9 +130,9 @@ the media, and replies to the original poster with it as a file attachment.
 | `PLAYLIST_AUTO_THREAD` | `true` | Automatically create a thread to post playlist videos to avoid channel clutter |
 | `PLAYLIST_PROMPT_TIMEOUT_SECONDS` | `30` | Timeout in seconds before defaulting to single video download or cancelling |
 | `ENABLE_SUBTITLES` | `true` | Automatically download and archive creator-provided subtitles/captions |
-| `UPLOAD_SUBTITLES_TO_DISCORD` | `false` | Upload subtitle files into Discord (`false` = archive locally on PC only, keeping Discord clean) |
+| `UPLOAD_SUBTITLES_TO_DISCORD` | `true` | Upload subtitle files into Discord (`false` = archive locally on PC only, keeping Discord clean) |
 | `SUBTITLE_SOURCE` | `creator` | Source of subtitles (`creator` or `all` for auto-generated) |
-| `SUBTITLE_LANGS` | `all` | Preferred subtitle languages (`all`, `en`, `en.*,ja`) |
+| `SUBTITLE_LANGS` | `en.*,en` | Preferred subtitle languages (`all`, `en`, `en.*,ja`) |
 | `SUBTITLE_FORMAT` | `srt` | Target subtitle format (`srt`, `vtt`) |
 | `ZIP_MULTI_SUBTITLES` | `true` | Zips subtitle files if a video has many language tracks to avoid Discord spam |
 | `MAX_INDIVIDUAL_SUBTITLES` | `3` | Max subtitle files to upload individually before bundling into a .zip archive |
@@ -124,15 +154,17 @@ the media, and replies to the original poster with it as a file attachment.
 | `AUTO_SCAN_REPOST_MISSING` | `true` | Repost missing media attachments to Discord during the startup catch-up scan |
 | `AUTO_SCAN_CONCURRENCY` | `3` | Number of parallel download workers during the startup catch-up scan |
 | `COOKIES_FROM_BROWSER` | `firefox` | Directly read login cookies from your local browser (`firefox`, `chrome`, `edge`, `brave`) |
-| `PREFER_BROWSER_COOKIES` | `false` | Prioritize browser cookies over manual cookie files in `./cookies` |
+| `PREFER_BROWSER_COOKIES` | `true` | Prioritize browser cookies over manual cookie files in `./cookies` |
 | `PIXIV_REFRESH_TOKEN` | — | Pixiv OAuth refresh token (auto-cached by `pixiv_login.bat`) |
+| `USE_PYTHON_GALLERYDL` | `false` | Force Python module execution (`python -m gallery_dl`) instead of standalone binary |
 | `IMPERSONATE_BROWSER` | `auto` | Mimic real browser fingerprint (`auto`, `chrome`, `firefox`, `edge`, `safari`, `off`) to bypass anti-bot blocks |
 | `ENABLE_HUMAN_JITTER` | `true` | Add subtle randomized delays between download requests to prevent rate limits |
 | `HUMAN_JITTER_MIN_MS` | `1500` | Minimum delay in milliseconds for human jitter |
 | `HUMAN_JITTER_MAX_MS` | `3500` | Maximum delay in milliseconds for human jitter |
 | `ENABLE_WEB_UI` | `true` | Launch the browser-based Web Downloader & Dashboard on startup |
 | `WEB_PORT` | `3000` | Port for the Web UI server |
-| `WEB_HOST` | `0.0.0.0` | Host binding for Web UI (`0.0.0.0` allows LAN access, `127.0.0.1` for local only) |
+| `WEB_HOST` | `127.0.0.1` | Host binding for Web UI (`127.0.0.1` for local only, `0.0.0.0` allows LAN access) |
+| `WEB_AUTH_TOKEN` | — | Optional security token for Web UI authentication (passed via header or `?token=`) |
 
 ## Slash Commands & Context Menu Apps
 
@@ -214,9 +246,19 @@ Archivist Fox includes a built-in browser-based control center and media player:
 - **Access**: Open `http://localhost:3000` (or your configured `WEB_PORT`) in any browser.
 - **Features**:
   - **Direct Downloader**: Paste any supported media link into the web input to download and archive immediately with real-time SSE progress indicators (`checking`, `downloading`, `processing`, `archiving`).
+  - **RFC 7233 Range Streaming**: Fast partial content seeking (`HTTP 206`) for audio and video media playback directly in web browsers.
   - **Integrated Archive Explorer**: Browse your local `./archives` library with responsive image, video, and audio players.
-  - **Windows Explorer Shortcut**: Click the folder icon to instantly reveal any downloaded file in your Windows file manager.
-  - **Live Telemetry & Diagnostics**: View live database link counts, active download queue depths, and archive disk usage.
+  - **Windows Explorer Shortcut**: Click the folder icon to instantly reveal any downloaded file in your Windows file manager (strictly guarded by host containment and loopback client restriction).
+  - **Optional Token Authentication (`WEB_AUTH_TOKEN`)**: Protect remote web access by configuring an authentication token passed via `X-Auth-Token` header, `Authorization: Bearer`, or URL parameter `?token=`.
+  - **Live Telemetry & Diagnostics**: View live database link counts, active download queue depths, and $O(1)$ archive disk usage.
+
+## User Attachment Archiving (Direct Uploads)
+
+Archivist Fox doesn't just download links—it also preserves media files uploaded directly to Discord:
+- **Zero Configuration Needed**: Enabled by default (`ARCHIVE_USER_ATTACHMENTS=true`).
+- **Preserves Native Uploads**: Whenever a user uploads raw images, videos, GIFs, or audio files into any allowed channel, the bot silently downloads and saves the original file to `./archives` alongside a structured `.json` metadata sidecar.
+- **Silent Preservation**: Unlike link downloads, user attachments are archived silently without re-uploading an extra attachment to chat, keeping Discord clean.
+- **Disaster Proof**: If a user later deletes their Discord message or leaves the server, the uploaded artwork or video remains permanently preserved in your local archive!
 
 ## Auto-Spoiler System (NSFW & Sensitive Media)
 
@@ -290,13 +332,27 @@ npm run convert-gifs
 npm run deduplicate
 # Options: --dry-run, --channel=<name>
 
-# Upgrade older low-resolution (360p) archived YouTube videos to 1080p/4K with 4x concurrent fragments
+# Upgrade archived YouTube videos to highest available resolution (4K/8K) and bitrate (including YouTube Premium 1080p Enhanced Bitrate & 256kbps Opus)
 npm run redownload-youtube
+# Options:
+#   --dry-run, -d                   Audit archived videos for higher resolution/bitrate without modifying files
+#   --premium, --upgrade-bitrate    Check all archived YouTube videos for higher resolution & Premium bitrate (default)
+#   --low-res-only                  Fast local filter: only upgrade videos stored at <= 360p
+#   --force, -f                     Force re-downloading even if resolution/bitrate already matches
+#   --max-res <height>, -m <height> Cap target resolution (e.g. 1080, 1440, 2160; default: 0 / uncapped 4K/8K)
+#   --concurrency <N>, -P <N>       Parallel metadata inspection workers (default: 5, max: 16)
+#   --fragments <N>, -N <N>         Concurrent connection fragments per stream (default: 4)
+#   --min-bitrate-gain <pct>        Minimum % bitrate increase required to replace same-res video (default: 5)
+#   --backup, -b                    Keep previous video file as <filename>.bak before replacing
+#   --cookies-from-browser, -C <br> Browser to read YouTube Premium cookies from (firefox, chrome, edge, brave)
+#   --no-browser-cookies            Use cookies/youtube.txt instead of browser cookies
+#   --channel <name>, -c <name>     Only process videos from a specific channel folder
+#   --url <url>, -u <url>           Upgrade a single specific video by YouTube URL or ID
 ```
 
 ## Running Tests
 
-Archivist Fox includes a native test suite with 94 unit and integration tests across 35 suites covering commands, configuration, database operations, dual-format GIF processing, idempotent archiving, task cancellation (`/stop`), export formatting, and URL extraction:
+Archivist Fox includes a comprehensive native test suite with **173 unit and integration tests across 77 suites** covering commands, configuration, database operations, cascading deduplication, SSRF security, Web UI Range streaming, dual-format GIF processing, idempotent archiving, task cancellation (`/stop`), export formatting, URL extraction, and YouTube quality upgrading:
 
 ```bash
 # Run all tests

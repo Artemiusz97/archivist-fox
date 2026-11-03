@@ -1,25 +1,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { config } from './config.js';
-import { run, getBestVideoEncoder } from './compress.js';
-import { isAbortError } from './utils.js';
-
-const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'webm', 'mkv', 'm4v']);
-
-function isVideo(filePath) {
-  const ext = path.extname(filePath).slice(1).toLowerCase();
-  return VIDEO_EXTENSIONS.has(ext);
-}
+import { getBestVideoEncoder } from './compress.js';
+import { isAbortError, isVideo, probeMedia, runProcess } from './utils.js';
 
 /**
  * Finds or extracts a thumbnail image associated with the given video file.
  *
  * @param {string} videoPath - Absolute path to video
  * @param {string} [destDir] - Temp directory containing downloads
+ * @param {{ signal?: AbortSignal, mediaInfo?: object }} [options={}]
  * @returns {Promise<string|null>} Path to thumbnail file or null
  */
-export async function findThumbnailFile(videoPath, destDir) {
+export async function findThumbnailFile(videoPath, destDir, options = {}) {
   const directory = destDir || path.dirname(videoPath);
   const parsed = path.parse(videoPath);
   const imageExts = ['.jpg', '.jpeg', '.png', '.webp'];
@@ -44,7 +37,7 @@ export async function findThumbnailFile(videoPath, destDir) {
 
   // 3. Extract embedded cover art or representative frame
   const tempExtractedThumb = path.join(directory, `temp_thumb_${Date.now()}.jpg`);
-  const extracted = await extractEmbeddedThumbnail(videoPath, tempExtractedThumb);
+  const extracted = await extractEmbeddedThumbnail(videoPath, tempExtractedThumb, options);
   if (extracted) {
     return tempExtractedThumb;
   } else {
@@ -56,14 +49,8 @@ export async function findThumbnailFile(videoPath, destDir) {
 
 /**
  * Injects a ~0.15s freeze frame of the YouTube/platform thumbnail at 00:00:00.
- * This forces Discord's chat player snapshot mechanism (which strictly captures frame 0)
- * to display the official thumbnail instead of a blank/black frame.
- * The audio track is stream-copied (-c:a copy) so audio is 100% preserved with zero drift.
- *
- * @param {string} videoPath - Absolute path to the downloaded video
- * @param {string} [destDir] - Temp directory where thumbnail might be located
- * @param {string} [providedThumbPath] - Optional pre-discovered thumbnail path
- * @returns {Promise<string>} - The resulting video path
+ * Forces Discord's chat player snapshot (frame 0) to display the official
+ * thumbnail instead of a blank/black frame while stream-copying audio (`-c:a copy`).
  */
 export async function applyThumbnailPreview(videoPath, destDir, providedThumbPath = null, options = {}) {
   if (!config.prependThumbnailPreview) return videoPath;
@@ -72,32 +59,33 @@ export async function applyThumbnailPreview(videoPath, destDir, providedThumbPat
   const directory = destDir || path.dirname(videoPath);
   const parsed = path.parse(videoPath);
 
-  let thumbPath = providedThumbPath && fs.existsSync(providedThumbPath)
+  const thumbPath = providedThumbPath && fs.existsSync(providedThumbPath)
     ? providedThumbPath
-    : await findThumbnailFile(videoPath, directory);
+    : await findThumbnailFile(videoPath, directory, options);
 
   if (!thumbPath) {
-    return videoPath; // No thumbnail available to inject
+    return videoPath;
   }
 
   const isTempExtracted = path.basename(thumbPath).startsWith('temp_thumb_');
   const tempOutput = path.join(directory, `thumb_injected_${Date.now()}_${parsed.name}.mp4`);
 
   try {
-    // 2. Probe video dimensions
-    const dimensions = await getVideoDimensions(videoPath, options.signal);
+    const dimensions =
+      options.mediaInfo?.width > 0 && options.mediaInfo?.height > 0
+        ? { width: options.mediaInfo.width, height: options.mediaInfo.height }
+        : await getVideoDimensions(videoPath, options.signal);
+
     if (!dimensions || !dimensions.width || !dimensions.height) {
       return videoPath;
     }
 
-    // Ensure even dimensions for H.264 encoder compatibility
-    const width = dimensions.width % 2 === 0 ? dimensions.width : dimensions.width - 1;
-    const height = dimensions.height % 2 === 0 ? dimensions.height : dimensions.height - 1;
+    const width = Math.max(2, dimensions.width % 2 === 0 ? dimensions.width : dimensions.width - 1);
+    const height = Math.max(2, dimensions.height % 2 === 0 ? dimensions.height : dimensions.height - 1);
 
     const primaryEncoder = await getBestVideoEncoder();
     let success = await tryInject(primaryEncoder, videoPath, thumbPath, width, height, tempOutput, options.signal);
 
-    // Fall back to CPU libx264 if GPU encoder failed
     if (!success && primaryEncoder !== 'libx264') {
       console.warn(`[ThumbnailPreview] ${primaryEncoder} failed, falling back to libx264...`);
       success = await tryInject('libx264', videoPath, thumbPath, width, height, tempOutput, options.signal);
@@ -115,7 +103,6 @@ export async function applyThumbnailPreview(videoPath, destDir, providedThumbPat
     if (isAbortError(err) || options.signal?.aborted) throw err;
     console.warn(`[ThumbnailPreview] Failed to inject thumbnail preview for ${parsed.base}:`, err.message);
   } finally {
-    // Clean up temporary extracted thumbnail image
     if (isTempExtracted) {
       await fs.promises.unlink(thumbPath).catch(() => {});
     }
@@ -137,14 +124,12 @@ async function tryInject(encoder, videoPath, thumbPath, width, height, tempOutpu
     '-map', '0:a?',
     ...encoderArgs,
     '-c:a', 'copy',
-    // Move MP4 moov atom to the front of the file so Discord can start streaming
-    // immediately without waiting for the full download to complete.
     '-movflags', '+faststart',
     tempOutput,
   ];
 
   try {
-    await run(config.ffmpegPath, args, 4 * 60 * 1000, signal);
+    await runProcess(config.ffmpegPath, args, { timeoutMs: 4 * 60 * 1000, signal });
     return fs.existsSync(tempOutput);
   } catch (err) {
     await fs.promises.unlink(tempOutput).catch(() => {});
@@ -154,92 +139,74 @@ async function tryInject(encoder, videoPath, thumbPath, width, height, tempOutpu
 }
 
 export async function getVideoDimensions(videoPath, signal = null) {
-  try {
-    const { stdout } = await run(config.ffprobePath, [
-      '-v', 'error',
-      '-select_streams', 'v:0',
-      '-show_entries', 'stream=width,height',
-      '-of', 'csv=s=x:p=0',
-      videoPath,
-    ], 60 * 1000, signal);
-    const parts = stdout.trim().split('x');
-    if (parts.length >= 2) {
-      const width = parseInt(parts[0], 10);
-      const height = parseInt(parts[1], 10);
-      if (!isNaN(width) && !isNaN(height) && width > 0 && height > 0) {
-        return { width, height };
-      }
-    }
-  } catch (err) {
-    if (isAbortError(err) || signal?.aborted) throw err;
+  const info = await probeMedia(videoPath, { timeoutMs: 30000, signal });
+  if (info.width > 0 && info.height > 0) {
+    return { width: info.width, height: info.height };
   }
   return null;
 }
 
-async function extractEmbeddedThumbnail(videoPath, destThumbPath) {
+async function extractEmbeddedThumbnail(videoPath, destThumbPath, options = {}) {
+  const signal = options?.signal || null;
   try {
-    // 1. Probe for any embedded image stream (e.g. mjpeg/png attached picture)
-    const probeProc = spawn(config.ffprobePath || 'ffprobe', [
-      '-v', 'error',
-      '-select_streams', 'v',
-      '-show_entries', 'stream=index,codec_name',
-      '-of', 'json',
-      videoPath,
-    ]);
-    let probeOut = '';
-    probeProc.stdout.on('data', (d) => (probeOut += d.toString()));
-    await new Promise((r) => probeProc.on('close', r));
+    const info = options?.mediaInfo?.attachedPicStreamIndex !== undefined
+      ? options.mediaInfo
+      : await probeMedia(videoPath, { timeoutMs: 15000, signal });
 
-    let thumbStreamIndex = null;
-    try {
-      const data = JSON.parse(probeOut);
-      const imgStream = data.streams?.find(
-        (s) => s.codec_name === 'mjpeg' || s.codec_name === 'png' || s.codec_name === 'webp'
-      );
-      if (imgStream) {
-        thumbStreamIndex = imgStream.index;
-      }
-    } catch {}
+    const thumbStreamIndex = info.attachedPicStreamIndex ?? null;
 
     if (thumbStreamIndex !== null) {
-      await run(config.ffmpegPath, [
-        '-y',
-        '-i', videoPath,
-        '-map', `0:${thumbStreamIndex}`,
-        '-c:v', 'copy',
-        '-frames:v', '1',
-        destThumbPath,
-      ]);
+      await runProcess(
+        config.ffmpegPath,
+        [
+          '-y',
+          '-i', videoPath,
+          '-map', `0:${thumbStreamIndex}`,
+          '-c:v', 'copy',
+          '-frames:v', '1',
+          destThumbPath,
+        ],
+        { timeoutMs: 30000, signal }
+      );
       const stat = await fs.promises.stat(destThumbPath).catch(() => null);
       if (stat && stat.size > 0) return true;
     }
 
-    // 2. Fallback for older videos without embedded cover art: use FFmpeg smart representative frame filter
     try {
-      await run(config.ffmpegPath, [
+      await runProcess(
+        config.ffmpegPath,
+        [
+          '-y',
+          '-i', videoPath,
+          '-vf', 'thumbnail=300',
+          '-frames:v', '1',
+          '-q:v', '2',
+          destThumbPath,
+        ],
+        { timeoutMs: 30000, signal }
+      );
+      const stat = await fs.promises.stat(destThumbPath).catch(() => null);
+      if (stat && stat.size > 0) return true;
+    } catch (err) {
+      if (isAbortError(err) || signal?.aborted) throw err;
+    }
+
+    await runProcess(
+      config.ffmpegPath,
+      [
         '-y',
+        '-ss', '00:00:01.000',
         '-i', videoPath,
-        '-vf', 'thumbnail=300',
         '-frames:v', '1',
         '-q:v', '2',
         destThumbPath,
-      ]);
-      const stat = await fs.promises.stat(destThumbPath).catch(() => null);
-      if (stat && stat.size > 0) return true;
-    } catch {}
-
-    // 3. Last-resort fallback: extract frame from 1.0s
-    await run(config.ffmpegPath, [
-      '-y',
-      '-ss', '00:00:01.000',
-      '-i', videoPath,
-      '-frames:v', '1',
-      '-q:v', '2',
-      destThumbPath,
-    ]);
+      ],
+      { timeoutMs: 30000, signal }
+    );
     const stat = await fs.promises.stat(destThumbPath).catch(() => null);
     return Boolean(stat && stat.size > 0);
-  } catch {
+  } catch (err) {
+    if (isAbortError(err) || signal?.aborted) throw err;
     return false;
   }
 }

@@ -1,31 +1,85 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { config } from './config.js';
 import { mergeOrphanedAudioVideo } from './streamMerge.js';
 import { getCookieForUrl } from './cookieVault.js';
-import { killProcessTree, getBrowserUserAgent, registerDownloadProcess, unregisterDownloadProcess } from './utils.js';
+import {
+  getBrowserUserAgent,
+  runProcess,
+  isPartialTempFile,
+  isCookieLockError,
+  purgeTempDownloadArtifacts,
+  isAbortError,
+} from './utils.js';
 import { isAudioUrl, checkNsfwInMetadata } from './urlExtractor.js';
 
 const TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes (allows buffer for large downloads and rate-limits)
 
 /**
- * Uses yt-dlp to download media from a platform link (Twitter/X, TikTok,
- * Instagram, Reddit, etc). Returns an array of downloaded file paths.
- * yt-dlp handles the size cap itself via --max-filesize.
+ * Builds shared browser-impersonation, User-Agent, and cookie authentication
+ * CLI flags for `yt-dlp` (shared between single downloads and playlist fetches).
+ *
+ * @param {string} url
+ * @param {{ disableBrowserCookies?: boolean }} [options={}]
+ * @returns {string[]}
  */
-export async function downloadWithYtDlp(url, destDir, options = {}) {
-  if (options?.signal?.aborted) {
-    throw new Error('DOWNLOAD_ABORTED');
+export function buildYtDlpAuthArgs(url, options = {}) {
+  const args = [];
+
+  let impersonateTarget = config.impersonateBrowser;
+  if (impersonateTarget === 'auto') {
+    if (config.cookiesFromBrowser) {
+      const lower = config.cookiesFromBrowser.toLowerCase();
+      if (lower.includes('firefox')) impersonateTarget = 'firefox';
+      else if (lower.includes('edge')) impersonateTarget = 'edge';
+      else if (lower.includes('safari')) impersonateTarget = 'safari';
+      else impersonateTarget = 'chrome';
+    } else {
+      impersonateTarget = 'chrome';
+    }
   }
 
-  await fs.promises.mkdir(destDir, { recursive: true });
+  const isImpersonateDisabled =
+    !impersonateTarget ||
+    impersonateTarget === 'off' ||
+    impersonateTarget === 'none' ||
+    impersonateTarget === 'false';
 
-  // Cap at the hard cap here, not the target upload size: if the file comes
-  // in over the target we still want the bytes on disk so compress.js has
-  // something to shrink. The target-size check happens after download.
+  if (!isImpersonateDisabled) {
+    args.push('--impersonate', impersonateTarget);
+  }
+
+  const activeBrowserType = !isImpersonateDisabled ? impersonateTarget : config.cookiesFromBrowser || 'chrome';
+  args.push('--user-agent', getBrowserUserAgent(activeBrowserType));
+
+  const cookiePath = getCookieForUrl(url);
+  const allowBrowserCookies = Boolean(config.cookiesFromBrowser && !options.disableBrowserCookies);
+  if (allowBrowserCookies) {
+    const isYoutube = /youtube\.com|youtu\.be/i.test(url);
+    if (config.preferBrowserCookies || isYoutube || !cookiePath || !fs.existsSync(cookiePath)) {
+      args.push('--cookies-from-browser', config.cookiesFromBrowser);
+    } else {
+      args.push('--cookies', cookiePath);
+    }
+  } else if (cookiePath && fs.existsSync(cookiePath)) {
+    args.push('--cookies', cookiePath);
+  }
+
+  return args;
+}
+
+/**
+ * Builds the complete `yt-dlp` CLI argument array for a media URL.
+ * Supports original titles, thumbnails, and English-by-default subtitle extraction
+ * across YouTube and all other video platforms supported by `yt-dlp`.
+ *
+ * @param {string} url
+ * @param {string} destDir
+ * @param {object} [options={}]
+ * @returns {string[]}
+ */
+export function buildYtDlpArgs(url, destDir, options = {}) {
   const hardCapMB = Math.max(1, Math.floor(config.hardCapBytes / (1024 * 1024)));
-  // Use the post/video's actual full title for the filename, Windows-safe without stripping Unicode or spaces
   const outputTemplate = path.join(destDir, '%(title).150s.%(ext)s');
 
   const args = [
@@ -55,11 +109,8 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
     }
   } else {
     args.push(
-      // Priority order:
-      //  1. Native MP4+M4A streams — zero remux, fully Discord-compatible
-      //  2. Best video + best audio (any container) merged via ffmpeg
-      //  3. Best pre-merged single stream (e.g. platforms with no separate streams)
-      '-f', 'bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b',
+      '-f', 'bv*+ba/b',
+      '-S', 'res,br,fps',
       '--merge-output-format', 'mp4'
     );
     if (config.embedThumbnail) {
@@ -73,62 +124,61 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
     }
   }
 
-  // --- Caption / Subtitle Extraction ---
-  if (config.enableSubtitles && (url.includes('youtube.com') || url.includes('youtu.be'))) {
+  // Universal Caption / Subtitle Extraction (English default across all video sites)
+  if (config.enableSubtitles && !shouldExtractAudio) {
     if (config.subtitleSource === 'all') {
       args.push('--write-sub', '--write-auto-subs');
     } else {
       args.push('--write-sub');
     }
-    args.push('--sub-langs', config.subtitleLangs || 'all');
+    args.push('--sub-langs', config.subtitleLangs || 'en.*,en');
     args.push('--convert-subs', config.subtitleFormat || 'srt');
+  }
+
+  if (options.sleepRequests) {
+    args.push('--sleep-requests', String(options.sleepRequests));
   }
 
   if (config.ffmpegPath && fs.existsSync(config.ffmpegPath)) {
     args.push('--ffmpeg-location', config.ffmpegPath);
   }
 
-  // Resolve browser impersonation & User-Agent
-  let impersonateTarget = config.impersonateBrowser;
-  if (impersonateTarget === 'auto') {
-    if (config.cookiesFromBrowser) {
-      const lower = config.cookiesFromBrowser.toLowerCase();
-      if (lower.includes('firefox')) impersonateTarget = 'firefox';
-      else if (lower.includes('edge')) impersonateTarget = 'edge';
-      else if (lower.includes('safari')) impersonateTarget = 'safari';
-      else impersonateTarget = 'chrome';
+  args.push(...buildYtDlpAuthArgs(url, options));
+  return args;
+}
+
+/**
+ * Uses yt-dlp to download media from a platform link (YouTube, Twitter/X, TikTok,
+ * Instagram, Reddit, Vimeo, etc).
+ */
+export async function downloadWithYtDlp(url, destDir, options = {}) {
+  if (options?.signal?.aborted) {
+    throw new Error('DOWNLOAD_ABORTED');
+  }
+
+  await fs.promises.mkdir(destDir, { recursive: true });
+
+  const runDl = async (extraOpts = {}) => {
+    const combinedOpts = { ...options, ...extraOpts };
+    const args = buildYtDlpArgs(url, destDir, combinedOpts);
+    return runProcess(config.ytdlpPath, args, {
+      timeoutMs: TIMEOUT_MS,
+      signal: options?.signal,
+    });
+  };
+
+  try {
+    await runDl();
+  } catch (err) {
+    if (options?.signal?.aborted || isAbortError(err)) throw err;
+    if (config.cookiesFromBrowser && isCookieLockError(err) && !options.disableBrowserCookies) {
+      console.warn('[yt-dlp] Browser cookie database locked; retrying without browser cookies...');
+      await purgeTempDownloadArtifacts(destDir);
+      await runDl({ disableBrowserCookies: true });
     } else {
-      impersonateTarget = 'chrome';
+      throw err;
     }
   }
-
-  const isImpersonateDisabled =
-    !impersonateTarget ||
-    impersonateTarget === 'off' ||
-    impersonateTarget === 'none' ||
-    impersonateTarget === 'false';
-
-  if (!isImpersonateDisabled) {
-    args.push('--impersonate', impersonateTarget);
-  }
-
-  // Set aligned User-Agent
-  const activeBrowserType = !isImpersonateDisabled ? impersonateTarget : config.cookiesFromBrowser || 'chrome';
-  args.push('--user-agent', getBrowserUserAgent(activeBrowserType));
-
-  const cookiePath = getCookieForUrl(url);
-  if (config.cookiesFromBrowser) {
-    const isYoutube = /youtube\.com|youtu\.be/i.test(url);
-    if (config.preferBrowserCookies || isYoutube || !cookiePath || !fs.existsSync(cookiePath)) {
-      args.push('--cookies-from-browser', config.cookiesFromBrowser);
-    } else {
-      args.push('--cookies', cookiePath);
-    }
-  } else if (cookiePath && fs.existsSync(cookiePath)) {
-    args.push('--cookies', cookiePath);
-  }
-
-  await runProcess(config.ytdlpPath, args, options?.signal);
 
   const files = await fs.promises.readdir(destDir);
   if (files.length === 0) {
@@ -137,21 +187,25 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
 
   const filePaths = files.map((f) => path.join(destDir, f));
 
-  // If media files exist, filter out any leftover loose thumbnail image files
   const mediaExtensions = new Set([
     '.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4v', '.gif',
-    '.mp3', '.m4a', '.opus', '.ogg', '.flac', '.wav', '.aac', '.alac', '.aiff'
+    '.mp3', '.m4a', '.opus', '.ogg', '.flac', '.wav', '.aac', '.alac', '.aiff',
   ]);
-  const mediaFiles = filePaths.filter((f) => mediaExtensions.has(path.extname(f).toLowerCase()));
+  const mediaFiles = filePaths.filter(
+    (f) => mediaExtensions.has(path.extname(f).toLowerCase()) && !isPartialTempFile(f)
+  );
   const subtitleFiles = filePaths.filter((f) => {
     const ext = path.extname(f).toLowerCase();
     return ext === '.srt' || ext === '.vtt' || ext === '.ass';
   });
+  const subtitleSet = new Set(subtitleFiles);
 
-  const candidateFiles = mediaFiles.length > 0 ? mediaFiles : filePaths.filter((f) => !f.endsWith('.json'));
+  const candidateFiles =
+    mediaFiles.length > 0
+      ? mediaFiles
+      : filePaths.filter((f) => !f.endsWith('.json') && !subtitleSet.has(f) && !isPartialTempFile(f));
   const mergedMedia = await mergeOrphanedAudioVideo(candidateFiles, destDir);
 
-  // Check .info.json for NSFW / age restriction and GIF flags
   let isNsfw = false;
   let isOriginalGif = false;
   const jsonFiles = filePaths.filter((f) => f.endsWith('.info.json') || f.endsWith('.json'));
@@ -175,125 +229,6 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
   return { mediaFiles: mergedMedia, subtitleFiles, isNsfw, isOriginalGif };
 }
 
-function runProcess(cmd, args, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      return reject(new Error('DOWNLOAD_ABORTED'));
-    }
-
-    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    registerDownloadProcess(child);
-    let stderr = '';
-
-    const timer = setTimeout(() => {
-      unregisterDownloadProcess(child);
-      killProcessTree(child);
-      reject(new Error(`TIMEOUT: ${cmd} took too long`));
-    }, TIMEOUT_MS);
-
-    const onAbort = () => {
-      clearTimeout(timer);
-      unregisterDownloadProcess(child);
-      killProcessTree(child);
-      reject(new Error('DOWNLOAD_ABORTED'));
-    };
-
-    if (signal) {
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
-
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      unregisterDownloadProcess(child);
-      if (signal) signal.removeEventListener('abort', onAbort);
-      if (err.code === 'ENOENT') {
-        reject(new Error(`COMMAND_NOT_FOUND: ${cmd} is not installed or not on PATH`));
-      } else {
-        reject(err);
-      }
-    });
-
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      unregisterDownloadProcess(child);
-      if (signal) signal.removeEventListener('abort', onAbort);
-      if (signal?.aborted) {
-        reject(new Error('DOWNLOAD_ABORTED'));
-      } else if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(`${cmd} exited with code ${code}: ${stderr.trim()}`));
-      }
-    });
-  });
-}
-
-function runProcessWithStdout(cmd, args, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      return reject(new Error('DOWNLOAD_ABORTED'));
-    }
-
-    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    registerDownloadProcess(child);
-    let stdout = '';
-    let stderr = '';
-
-    const timer = setTimeout(() => {
-      unregisterDownloadProcess(child);
-      killProcessTree(child);
-      reject(new Error(`TIMEOUT: ${cmd} took too long`));
-    }, 30000); // Shorter timeout for flat playlist extraction
-
-    const onAbort = () => {
-      clearTimeout(timer);
-      unregisterDownloadProcess(child);
-      killProcessTree(child);
-      reject(new Error('DOWNLOAD_ABORTED'));
-    };
-
-    if (signal) {
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
-
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString();
-    });
-
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      unregisterDownloadProcess(child);
-      if (signal) signal.removeEventListener('abort', onAbort);
-      if (err.code === 'ENOENT') {
-        reject(new Error(`COMMAND_NOT_FOUND: ${cmd} is not installed or not on PATH`));
-      } else {
-        reject(err);
-      }
-    });
-
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      unregisterDownloadProcess(child);
-      if (signal) signal.removeEventListener('abort', onAbort);
-      if (signal?.aborted) {
-        reject(new Error('DOWNLOAD_ABORTED'));
-      } else if (code === 0) {
-        resolve(stdout);
-      } else {
-        reject(new Error(`${cmd} exited with code ${code}: ${stderr.trim()}`));
-      }
-    });
-  });
-}
-
 /**
  * Extracts flat playlist metadata without downloading media.
  */
@@ -306,43 +241,20 @@ export async function fetchFlatPlaylistInfo(url, maxItems = 25, options = {}) {
     '--no-warnings',
     '--no-check-certificates',
     '--js-runtimes', 'node',
+    ...buildYtDlpAuthArgs(url),
   ];
 
-  // Apply impersonation/cookies exactly like the download pipeline
-  let impersonateTarget = config.impersonateBrowser;
-  if (impersonateTarget === 'auto') {
-    if (config.cookiesFromBrowser) {
-      const lower = config.cookiesFromBrowser.toLowerCase();
-      if (lower.includes('firefox')) impersonateTarget = 'firefox';
-      else if (lower.includes('edge')) impersonateTarget = 'edge';
-      else if (lower.includes('safari')) impersonateTarget = 'safari';
-      else impersonateTarget = 'chrome';
-    } else {
-      impersonateTarget = 'chrome';
-    }
-  }
-  const isImpersonateDisabled = !impersonateTarget || ['off', 'none', 'false'].includes(impersonateTarget);
-  if (!isImpersonateDisabled) {
-    args.push('--impersonate', impersonateTarget);
-  }
-  const activeBrowserType = !isImpersonateDisabled ? impersonateTarget : config.cookiesFromBrowser || 'chrome';
-  args.push('--user-agent', getBrowserUserAgent(activeBrowserType));
+  const execFn = options?.execFn || runProcess;
+  const { stdout } = await execFn(config.ytdlpPath, args, {
+    timeoutMs: 30000,
+    signal: options?.signal,
+    maxBufferBytes: 32 * 1024 * 1024,
+    rollingBuffer: false,
+  });
 
-  const cookiePath = getCookieForUrl(url);
-  if (config.cookiesFromBrowser) {
-    if (config.preferBrowserCookies || !cookiePath || !fs.existsSync(cookiePath)) {
-      args.push('--cookies-from-browser', config.cookiesFromBrowser);
-    } else {
-      args.push('--cookies', cookiePath);
-    }
-  } else if (cookiePath && fs.existsSync(cookiePath)) {
-    args.push('--cookies', cookiePath);
-  }
-
-  const output = await runProcessWithStdout(config.ytdlpPath, args, options?.signal);
   try {
-    return JSON.parse(output.trim());
-  } catch (err) {
+    return JSON.parse(stdout.trim());
+  } catch {
     throw new Error('Failed to parse yt-dlp playlist JSON');
   }
 }

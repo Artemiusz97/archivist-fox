@@ -3,10 +3,10 @@ import { config, isChannelAllowed, isLinkBackupChannel, requireDiscordToken } fr
 import { handleMessage } from './mediaHandler.js';
 import { processMessageLinks } from './linkDetector.js';
 import { initLinkDb, pruneExpiredLinks, closeLinkDb, checkpointWal, getDistinctLinkChannels } from './linkDb.js';
-import { scheduleAutoDelete, scheduleCommandMessageDelete, cleanupStaleTempDirs } from './utils.js';
+import { scheduleAutoDelete, scheduleCommandMessageDelete, cleanupStaleTempDirs, isModeratorOrOwner } from './utils.js';
 import { ensureBinaries } from './ensureBinaries.js';
 import { initAutoUpdater } from './autoUpdater.js';
-import { handleRescanCommand, stopActiveTasks, runStartupScan } from './scanner.js';
+import { handleRescanCommand, stopActiveTasks, runStartupScan, formatStopSummary } from './scanner.js';
 import { registerCommands, handleInteraction, getHelpEmbed } from './commands.js';
 import { restoreLinks, isRestoreRunning } from './linkRestorer.js';
 import { startWebServer } from './web/server.js';
@@ -18,6 +18,10 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
   ],
   partials: [Partials.Message, Partials.Channel],
+  rest: {
+    timeout: 60_000, // 60s prevents premature timeouts on large file uploads (Discord.js default is 15s)
+    retries: 1,      // Single retry for genuine connection drops without spamming duplicates
+  },
 });
 client.on(Events.Error, (err) => {
   console.error('[Discord Client] Network or client error:', err?.message || err);
@@ -59,11 +63,12 @@ client.once(Events.ClientReady, () => {
     console.log(
       `[Startup Scan] Automatic catch-up scan scheduled in 2.5s (window: last ${config.autoScanHours} hour(s), repostMissing=${config.autoScanRepostMissing})...`
     );
-    setTimeout(() => {
+    const startupTimer = setTimeout(() => {
       runStartupScan(client).catch((err) => {
         console.error('[Startup Scan] Unexpected error during startup catch-up scan:', err);
       });
     }, 2500);
+    startupTimer.unref?.();
   }
 });
 
@@ -158,10 +163,7 @@ client.on('messageCreate', async (message) => {
 
     if (isStopCommand(message.content)) {
       scheduleCommandMessageDelete(message);
-      const isMod =
-        message.member?.permissions?.has(PermissionFlagsBits.ManageMessages) ||
-        message.member?.permissions?.has(PermissionFlagsBits.Administrator) ||
-        message.guild?.ownerId === message.author.id;
+      const isMod = isModeratorOrOwner(message.member, message.guild, message.author.id);
 
       if (!isMod) {
         const notice = await message.reply({
@@ -172,29 +174,20 @@ client.on('messageCreate', async (message) => {
         return;
       }
 
-      const stopped = stopActiveTasks();
-      if (stopped.scanRunning || stopped.playlistRunning || stopped.restoreRunning || stopped.queueItemsCleared > 0 || stopped.activeDownloadsStopped > 0) {
-        let msg = '🛑 **Stopped active tasks:**\n';
-        if (stopped.scanRunning) msg += '• Aborted active channel rescan / media crawl.\n';
-        if (stopped.restoreRunning) msg += '• Aborted active link restoration / reposting.\n';
-        if (stopped.playlistRunning) msg += '• Aborted active playlist download.\n';
-        if (stopped.activeDownloadsStopped > 0) msg += `• Aborted **${stopped.activeDownloadsStopped}** download(s) in progress.\n`;
-        if (stopped.queueItemsCleared > 0) msg += `• Cleared **${stopped.queueItemsCleared}** queued download(s).\n`;
-        const notice = await message.reply({ content: msg, allowedMentions: { repliedUser: false } });
-        scheduleAutoDelete(notice);
-      } else {
-        const notice = await message.reply({
-          content: 'ℹ️ No active downloads, rescan, playlist download, restoration, or queued tasks are currently running.',
-          allowedMentions: { repliedUser: false },
-        });
-        scheduleAutoDelete(notice);
-      }
+      const summary = formatStopSummary(stopActiveTasks());
+      const notice = await message.reply({
+        content: summary.message,
+        allowedMentions: { repliedUser: false },
+      });
+      scheduleAutoDelete(notice);
       return;
     }
 
     const retryInfo = parseRetryCommand(message.content);
     if (retryInfo) {
-      await handleRetryCommand(message, retryInfo.isForce, retryInfo.cmd);
+      if (mediaAllowed) {
+        await handleRetryCommand(message, retryInfo.isForce, retryInfo.cmd);
+      }
       return;
     }
 
@@ -277,7 +270,8 @@ client.on('messageCreate', async (message) => {
 
         // Auto-delete the notice after 60 seconds so it doesn't clutter the channel
         const ttl = Math.max(15000, (config.errorMessageTtlMs || 30000) * 2);
-        setTimeout(() => progressNotice.delete().catch(() => {}), ttl);
+        const restoreTimer = setTimeout(() => progressNotice.delete().catch(() => {}), ttl);
+        restoreTimer.unref?.();
       } catch (err) {
         await progressNotice.edit({ content: `❌ Restoration failed: ${err.message}` });
         scheduleAutoDelete(progressNotice);

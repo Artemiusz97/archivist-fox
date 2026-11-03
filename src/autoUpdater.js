@@ -1,28 +1,22 @@
-import { spawn } from 'node:child_process';
 import { config } from './config.js';
 import { downloadQueue } from './queue.js';
 import { isScanRunning } from './scanner.js';
+import { runProcess, PYTHON_BIN } from './utils.js';
 
-function runUpdateCommand(cmd, args) {
-  return new Promise((resolve) => {
-    try {
-      const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-      let output = '';
-
-      child.stdout.on('data', (d) => (output += d.toString()));
-      child.stderr.on('data', (d) => (output += d.toString()));
-
-      child.on('error', (err) => {
-        resolve({ success: false, error: err.message });
-      });
-
-      child.on('close', (code) => {
-        resolve({ success: code === 0, output: output.trim() });
-      });
-    } catch (err) {
-      resolve({ success: false, error: err.message });
-    }
-  });
+async function runUpdateCommand(cmd, args) {
+  try {
+    const { code, stdout, stderr } = await runProcess(cmd, args, {
+      timeoutMs: 2 * 60 * 1000,
+      registerProcess: false,
+      rejectOnNonZero: false,
+    });
+    const combined = `${stdout}\n${stderr}`.trim();
+    return code === 0
+      ? { success: true, output: combined }
+      : { success: false, error: combined || `Exited with code ${code}` };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
 }
 
 export async function checkAndApplyUpdates() {
@@ -30,7 +24,8 @@ export async function checkAndApplyUpdates() {
     console.log(
       `[AutoUpdater] Active tasks in progress (queue: ${downloadQueue?.running || 0}, scanActive: ${isScanRunning()}). Deferring binary update for 2 minutes...`
     );
-    setTimeout(() => checkAndApplyUpdates().catch(() => {}), 2 * 60 * 1000);
+    const deferTimer = setTimeout(() => checkAndApplyUpdates().catch(() => {}), 2 * 60 * 1000);
+    deferTimer.unref?.();
     return;
   }
 
@@ -51,7 +46,7 @@ export async function checkAndApplyUpdates() {
   // 2. Update gallery-dl
   try {
     if (config.usePythonGalleryDl) {
-      const gdlPipResult = await runUpdateCommand('python3', ['-m', 'pip', 'install', '-U', 'gallery-dl']);
+      const gdlPipResult = await runUpdateCommand(PYTHON_BIN, ['-m', 'pip', 'install', '-U', 'gallery-dl']);
       if (gdlPipResult.success) {
         console.log('[AutoUpdater] gallery-dl (Python package) updated successfully.');
       }
@@ -79,9 +74,10 @@ export function initAutoUpdater() {
   console.log(`[AutoUpdater] Scheduled binary updates every ${config.autoUpdateIntervalHours} hour(s).`);
 
   // Run initial check 60 seconds after bot boot to allow smooth startup
-  setTimeout(() => {
+  const initialTimer = setTimeout(() => {
     checkAndApplyUpdates().catch(() => {});
   }, 60 * 1000);
+  initialTimer.unref?.();
 
   // Set recurring interval timer
   const timer = setInterval(() => {

@@ -1,7 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import 'dotenv/config';
+import dotenv from 'dotenv';
 import { BOT_VERSION } from './version.js';
+
+const isTestEnv =
+  process.env.NODE_ENV === 'test' ||
+  process.execArgv.includes('--test') ||
+  Boolean(process.env.NODE_TEST_CONTEXT);
+if (!isTestEnv) {
+  dotenv.config();
+}
 
 function parseBool(value, fallback) {
   if (value === undefined || value === '') return fallback;
@@ -65,7 +73,7 @@ export const config = {
 
   ytdlpPath: resolveBinaryPath(process.env.YTDLP_PATH, 'yt-dlp'),
   gallerydlPath: resolveBinaryPath(process.env.GALLERYDL_PATH, 'gallery-dl'),
-  usePythonGalleryDl: false,
+  usePythonGalleryDl: parseBool(process.env.USE_PYTHON_GALLERYDL, false),
   // Optional: authenticate gallery-dl against Reddit's real API instead of
   // scraping pages, to avoid Reddit's "blocked by network security" wall.
   // See https://gdl-org.github.io/docs/configuration.html#extractor-reddit-client-id-user-agent
@@ -94,7 +102,7 @@ export const config = {
   // Optional: Read cookies directly from an installed browser (e.g. "firefox", "chrome", "edge", "brave")
   cookiesFromBrowser: (process.env.COOKIES_FROM_BROWSER || '').trim(),
   // Prefer browser cookies over static cookies/*.txt files when cookiesFromBrowser is enabled
-  preferBrowserCookies: parseBool(process.env.PREFER_BROWSER_COOKIES, false),
+  preferBrowserCookies: parseBool(process.env.PREFER_BROWSER_COOKIES, true),
   // Anti-Bot & Scraper Hardening (auto = match cookiesFromBrowser or chrome; off = disabled)
   impersonateBrowser: (process.env.IMPERSONATE_BROWSER || 'auto').toLowerCase().trim(),
   enableHumanJitter: parseBool(process.env.ENABLE_HUMAN_JITTER, true),
@@ -109,6 +117,7 @@ export const config = {
   ffprobePath: resolveBinaryPath(process.env.FFPROBE_PATH, 'ffprobe'),
   // Local high-quality archiving configuration
   enableLocalArchive: parseBool(process.env.ENABLE_LOCAL_ARCHIVE, true),
+  archiveUserAttachments: parseBool(process.env.ARCHIVE_USER_ATTACHMENTS, true),
   archiveDirectory: process.env.ARCHIVE_DIRECTORY || path.join(process.cwd(), 'archives'),
   archiveSaveMetadata: parseBool(process.env.ARCHIVE_SAVE_METADATA, true),
   // Perceptual hashing and duplicate prevention settings
@@ -118,7 +127,7 @@ export const config = {
   gpuAcceleration: (process.env.GPU_ACCELERATION || 'auto').toLowerCase().trim(),
   enableAutoUpdateBinaries: parseBool(process.env.ENABLE_AUTO_UPDATE_BINARIES, true),
   autoUpdateIntervalHours: Math.max(1, Number(process.env.AUTO_UPDATE_INTERVAL_HOURS || 24)),
-  maxConcurrentDownloads: Math.max(1, Number(process.env.MAX_CONCURRENT_DOWNLOADS || 2)),
+  maxConcurrentDownloads: Math.max(1, Number(process.env.MAX_CONCURRENT_DOWNLOADS || 3)),
   scannerConcurrency: Math.max(1, Number(process.env.SCANNER_CONCURRENCY || process.env.MAX_CONCURRENT_DOWNLOADS || 3)),
   cookiesDir: path.join(process.cwd(), 'cookies'),
   // UX & Storage Enhancements
@@ -127,7 +136,7 @@ export const config = {
   archiveSubfolderFormat: (process.env.ARCHIVE_SUBFOLDER_FORMAT || 'channel/date').toLowerCase().trim(),
   // Auto-Spoiler NSFW & User-Flagged Media
   autoSpoilerNsfw: parseBool(process.env.AUTO_SPOILER_NSFW, true),
-  spoilerNonNsfwChannelsOnly: parseBool(process.env.SPOILER_NON_NSFW_CHANNELS_ONLY, true),
+  spoilerNonNsfwChannelsOnly: parseBool(process.env.SPOILER_NON_NSFW_CHANNELS_ONLY, false),
   spoilerUserFlaggedLinks: parseBool(process.env.SPOILER_USER_FLAGGED_LINKS, true),
   spoilerTitles: parseBool(process.env.SPOILER_TITLES, true),
   // General Duplicate Link Detector configuration (SQLite)
@@ -163,9 +172,9 @@ export const config = {
 
   // Subtitle/Caption Extraction
   enableSubtitles: parseBool(process.env.ENABLE_SUBTITLES, true),
-  uploadSubtitlesToDiscord: parseBool(process.env.UPLOAD_SUBTITLES_TO_DISCORD, false),
+  uploadSubtitlesToDiscord: parseBool(process.env.UPLOAD_SUBTITLES_TO_DISCORD, true),
   subtitleSource: process.env.SUBTITLE_SOURCE || 'creator', // 'creator' or 'all'
-  subtitleLangs: process.env.SUBTITLE_LANGS || 'all',
+  subtitleLangs: process.env.SUBTITLE_LANGS || 'en.*,en',
   subtitleFormat: process.env.SUBTITLE_FORMAT || 'srt',
   zipMultiSubtitles: parseBool(process.env.ZIP_MULTI_SUBTITLES, true),
   maxIndividualSubtitles: Math.max(1, Number(process.env.MAX_INDIVIDUAL_SUBTITLES || 3)),
@@ -173,7 +182,8 @@ export const config = {
   // Web UI Configuration
   enableWebUi: parseBool(process.env.ENABLE_WEB_UI, true),
   webPort: Math.max(1, Number(process.env.WEB_PORT || 3000)),
-  webHost: process.env.WEB_HOST || '0.0.0.0',
+  webHost: process.env.WEB_HOST || '127.0.0.1',
+  webAuthToken: (process.env.WEB_AUTH_TOKEN || '').trim() || null,
 };
 
 export function requireDiscordToken() {
@@ -287,4 +297,37 @@ if (invalidDisallowed.length > 0) {
     `[Config] Warning: DISALLOWED_CHANNEL_IDS contains non-snowflake value(s) that will be ignored: ${invalidDisallowed.join(', ')}`
   );
   config.disallowedChannelIds = config.disallowedChannelIds.filter((id) => SNOWFLAKE_RE.test(id));
+}
+
+/**
+ * Temporarily overrides properties on `config` for the duration of `fn`,
+ * restoring original values automatically on return or throw (sync or async).
+ *
+ * @template T
+ * @param {Partial<typeof config>} overrides
+ * @param {() => T} fn
+ * @returns {T}
+ */
+export function withConfigOverrides(overrides, fn) {
+  const original = {};
+  for (const [k, v] of Object.entries(overrides || {})) {
+    original[k] = config[k];
+    config[k] = v;
+  }
+  const restore = () => {
+    for (const [k, v] of Object.entries(original)) {
+      config[k] = v;
+    }
+  };
+  try {
+    const result = fn();
+    if (result && typeof result.then === 'function') {
+      return result.finally(restore);
+    }
+    restore();
+    return result;
+  } catch (err) {
+    restore();
+    throw err;
+  }
 }

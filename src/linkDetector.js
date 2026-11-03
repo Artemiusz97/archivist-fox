@@ -1,4 +1,3 @@
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import { config, isLinkBackupChannel } from './config.js';
 import { extractAllUrlsAsync } from './urlExtractor.js';
 import {
@@ -6,11 +5,16 @@ import {
   saveLinkRecord,
   updateLinkRecord,
 } from './linkDb.js';
+import { buildDuplicateActionRow, formatDiscordAuthor, safeReply } from './utils.js';
+
+export { buildDuplicateActionRow };
 
 /**
  * Checks all URLs in a Discord message for duplicates against the SQLite link database.
  * Sends an alert if a duplicate is found (unless within self-repost grace period).
- * Records new links into the database.
+ * Records new links into the database (`is_backup = 1` for backup channels,
+ * `is_backup = 0` for non-backup channels so duplicate detection works everywhere
+ * without polluting link exports or `/restore`).
  *
  * @param {import('discord.js').Message} message
  * @returns {Promise<{
@@ -20,7 +24,8 @@ import {
  * }>}
  */
 export async function processMessageLinks(message) {
-  if (!config.enableGeneralDuplicateDetector) {
+  const backupEligible = isLinkBackupChannel(message.channel);
+  if (!config.enableGeneralDuplicateDetector && !backupEligible) {
     return { hasUrls: false, duplicateUrls: [], newUrls: [] };
   }
 
@@ -29,13 +34,35 @@ export async function processMessageLinks(message) {
     return { hasUrls: false, duplicateUrls: [], newUrls: [] };
   }
 
-  const authorTag = message.author?.tag || message.author?.username || 'Unknown';
+  const authorTag = formatDiscordAuthor(message.author);
   const authorId = message.author?.id || '0';
   const guildId = message.guildId || null;
   const channelId = message.channelId;
   const channelName = message.channel?.name || 'chat';
   const messageId = message.id;
   const postedAt = message.createdTimestamp || Date.now();
+
+  // If general duplicate detector is disabled, silently back up links for backup-eligible channels
+  if (!config.enableGeneralDuplicateDetector) {
+    const newUrls = [];
+    for (const { originalUrl, normalizedUrl } of urls) {
+      saveLinkRecord({
+        normalizedUrl,
+        originalUrl,
+        guildId,
+        channelId,
+        channelName,
+        messageId,
+        authorId,
+        authorTag,
+        postedAt,
+        content: message.content || null,
+        isBackup: true,
+      });
+      newUrls.push({ originalUrl, normalizedUrl });
+    }
+    return { hasUrls: true, duplicateUrls: [], newUrls };
+  }
 
   const duplicateUrls = [];
   const newUrls = [];
@@ -52,8 +79,6 @@ export async function processMessageLinks(message) {
     });
 
     if (isSelfGrace && record) {
-      // User reposted their own link within the grace period (e.g. editing, channel switch)
-      // Quietly update the record without triggering an alert
       updateLinkRecord(record.id, {
         messageId,
         channelId,
@@ -84,54 +109,33 @@ export async function processMessageLinks(message) {
         `ℹ️ This link was already posted by **@${record.author_tag}** ${channelMention} ${relativeTime}!\n🔗 [Jump to original message](<${jumpUrl}>)`
       );
     } else {
-      // First time seeing this link — save to database if channel is backup-eligible
-      if (isLinkBackupChannel(message.channel)) {
-        saveLinkRecord({
-          normalizedUrl,
-          originalUrl,
-          guildId,
-          channelId,
-          channelName,
-          messageId,
-          authorId,
-          authorTag,
-          postedAt,
-          content: message.content || null,
-        });
-      }
+      // Save link record; mark `isBackup: false` on non-backup channels so
+      // duplicate detection works across all active channels while exports remain clean.
+      saveLinkRecord({
+        normalizedUrl,
+        originalUrl,
+        guildId,
+        channelId,
+        channelName,
+        messageId,
+        authorId,
+        authorTag,
+        postedAt,
+        content: message.content || null,
+        isBackup: backupEligible,
+      });
       newUrls.push({ originalUrl, normalizedUrl });
     }
   }
 
-  // If duplicate URLs were found, send an alert reply
   if (alertLines.length > 0) {
     try {
-      const buttons = [];
+      const alertRow = buildDuplicateActionRow({
+        messageId,
+        authorId,
+        canDeletePost: newUrls.length === 0,
+      });
 
-      // If all links in the message are duplicates (no new/unique links to preserve),
-      // provide a button to delete the duplicate post directly.
-      if (newUrls.length === 0) {
-        buttons.push(
-          new ButtonBuilder()
-            .setCustomId(`delete_duplicate:${messageId}:${authorId}`)
-            .setLabel('Delete Post')
-            .setStyle(ButtonStyle.Danger)
-            .setEmoji('🗑️')
-        );
-      }
-
-      buttons.push(
-        new ButtonBuilder()
-          .setCustomId(`dismiss_alert:${authorId}`)
-          .setLabel('Dismiss')
-          .setStyle(ButtonStyle.Secondary)
-          .setEmoji('✖️')
-      );
-
-      const alertRow = new ActionRowBuilder().addComponents(buttons);
-
-      // Cap alert to 3 entries to stay within Discord's 2,000-character limit
-      // when a user pastes a message containing many duplicate URLs at once.
       const MAX_ALERT_LINES = 3;
       const visibleLines = alertLines.slice(0, MAX_ALERT_LINES);
       const overflowCount = alertLines.length - visibleLines.length;
@@ -139,13 +143,13 @@ export async function processMessageLinks(message) {
         visibleLines.push(`_…and ${overflowCount} more duplicate link(s)._`);
       }
 
-      const notice = await message.reply({
+      const notice = await safeReply(message, {
         content: visibleLines.join('\n\n'),
         components: [alertRow],
         allowedMentions: { repliedUser: false },
       });
 
-      if (config.duplicateLinkAlertTtlSeconds > 0) {
+      if (config.duplicateLinkAlertTtlSeconds > 0 && notice) {
         const timer = setTimeout(() => {
           notice.delete().catch(() => {});
         }, config.duplicateLinkAlertTtlSeconds * 1000);
@@ -162,3 +166,5 @@ export async function processMessageLinks(message) {
     newUrls,
   };
 }
+
+export const checkAndHandleDuplicateLinks = processMessageLinks;

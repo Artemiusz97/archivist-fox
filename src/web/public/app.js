@@ -35,6 +35,59 @@ document.addEventListener('DOMContentLoaded', () => {
   let libraryPage = 0;
   const libraryPageSize = 24;
 
+  // ─── Authentication Token Management ───────────────────────────────────────
+  const urlParams = new URLSearchParams(window.location.search);
+  if (urlParams.has('token')) {
+    const rawToken = urlParams.get('token');
+    if (rawToken) {
+      sessionStorage.setItem('archivist_web_token', rawToken.trim());
+    }
+    urlParams.delete('token');
+    const newSearch = urlParams.toString();
+    const newUrl = window.location.pathname + (newSearch ? `?${newSearch}` : '') + window.location.hash;
+    window.history.replaceState({}, '', newUrl);
+  }
+
+  function getAuthToken() {
+    return sessionStorage.getItem('archivist_web_token') || '';
+  }
+
+  function setAuthToken(token) {
+    if (token) {
+      sessionStorage.setItem('archivist_web_token', token.trim());
+    } else {
+      sessionStorage.removeItem('archivist_web_token');
+    }
+  }
+
+  function buildAuthorizedUrl(rawUrl) {
+    if (!rawUrl) return '';
+    const token = getAuthToken();
+    if (!token) return rawUrl;
+    if (/[?&]token=/.test(rawUrl)) return rawUrl;
+    const separator = rawUrl.includes('?') ? '&' : '?';
+    return `${rawUrl}${separator}token=${encodeURIComponent(token)}`;
+  }
+
+  async function authFetch(input, init = {}) {
+    const headers = new Headers(init.headers || {});
+    const token = getAuthToken();
+    if (token && !headers.has('X-Auth-Token')) {
+      headers.set('X-Auth-Token', token);
+    }
+    const response = await fetch(input, { ...init, headers });
+    if (response.status === 401) {
+      const enteredToken = window.prompt('Authentication required. Please enter your WEB_AUTH_TOKEN:');
+      if (enteredToken !== null && enteredToken.trim() !== '') {
+        const clean = enteredToken.trim();
+        setAuthToken(clean);
+        headers.set('X-Auth-Token', clean);
+        return fetch(input, { ...init, headers });
+      }
+    }
+    return response;
+  }
+
   // ─── Tabs ──────────────────────────────────────────────────────────────────
   tabs.forEach((tab) => {
     tab.addEventListener('click', () => {
@@ -67,7 +120,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // ─── Status & Version ──────────────────────────────────────────────────────
   async function fetchStatus() {
     try {
-      const res = await fetch('/api/status');
+      const res = await authFetch('/api/status');
       if (res.ok) {
         const data = await res.json();
         if (data.version && versionBadge) {
@@ -96,7 +149,7 @@ document.addEventListener('DOMContentLoaded', () => {
         saveToArchive: archiveToggle.checked,
       };
 
-      const res = await fetch('/api/download', {
+      const res = await authFetch('/api/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -140,7 +193,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function listenToTaskProgress(taskId) {
-    const eventSource = new EventSource(`/api/progress/${taskId}`);
+    const eventSource = new EventSource(buildAuthorizedUrl(`/api/progress/${taskId}`));
 
     eventSource.onmessage = (event) => {
       try {
@@ -165,7 +218,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   window.openFolder = async (targetPath) => {
     try {
-      const res = await fetch('/api/open-folder', {
+      const res = await authFetch('/api/open-folder', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: targetPath || '' }),
@@ -181,6 +234,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
   openArchiveFolderBtn?.addEventListener('click', () => window.openFolder());
   openLibraryFolderBtn?.addEventListener('click', () => window.openFolder());
+
+  function handleDelegatedAction(event) {
+    const actionBtn = event.target.closest('[data-action]');
+    if (!actionBtn) return;
+    const action = actionBtn.dataset.action;
+    if (action === 'preview') {
+      window.previewMedia(actionBtn.dataset.url, actionBtn.dataset.title, actionBtn.dataset.type);
+    } else if (action === 'open-folder') {
+      window.openFolder(actionBtn.dataset.path || '');
+    }
+  }
+
+  tasksList?.addEventListener('click', handleDelegatedAction);
+  libraryList?.addEventListener('click', handleDelegatedAction);
 
   function updateTaskCard(taskId, task) {
     const card = activeTasks.get(taskId);
@@ -207,10 +274,9 @@ document.addEventListener('DOMContentLoaded', () => {
           .map((f) => {
             const icon = f.isVideo ? '🎬' : f.isAudio ? '🎵' : '🖼️';
             const sizeStr = f.size ? formatBytes(f.size) : '';
-            const downloadUrl = `/api/file?file=${encodeURIComponent(f.path || f.filename)}&download=1`;
-            const previewUrl = `/api/file?file=${encodeURIComponent(f.path || f.filename)}`;
+            const targetFile = f.relativePath || f.path || f.filename || '';
+            const previewUrl = buildAuthorizedUrl(`/api/file?file=${encodeURIComponent(targetFile)}`);
             const mediaType = f.isVideo ? 'video' : f.isAudio ? 'audio' : 'image';
-            const safePath = (f.path || f.filename || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 
             return `
               <div class="result-item">
@@ -222,10 +288,10 @@ document.addEventListener('DOMContentLoaded', () => {
                   </div>
                 </div>
                 <div class="result-actions">
-                  <button class="btn btn-sm btn-primary" onclick="previewMedia('${previewUrl}', '${escapeHtml(f.title || f.filename)}', '${mediaType}')" title="Quickly view or play this media file">
+                  <button type="button" class="btn btn-sm btn-primary" data-action="preview" data-url="${escapeHtml(previewUrl)}" data-title="${escapeHtml(f.title || f.filename)}" data-type="${escapeHtml(mediaType)}" title="Quickly view or play this media file">
                     ▶ View File
                   </button>
-                  <button class="btn btn-sm btn-secondary" onclick="openFolder('${safePath}')" title="Open directory in Windows File Explorer">
+                  <button type="button" class="btn btn-sm btn-secondary" data-action="open-folder" data-path="${escapeHtml(targetFile)}" title="Open directory in Windows File Explorer">
                     📂 Go to Directory
                   </button>
                 </div>
@@ -245,7 +311,7 @@ document.addEventListener('DOMContentLoaded', () => {
               </div>
             </div>
             <div class="result-actions">
-              <button class="btn btn-sm btn-secondary" onclick="openFolder()" title="Open download directory in Windows File Explorer">
+              <button type="button" class="btn btn-sm btn-secondary" data-action="open-folder" data-path="" title="Open download directory in Windows File Explorer">
                 📂 Go to Directory
               </button>
             </div>
@@ -304,7 +370,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     try {
-      const res = await fetch(url);
+      const res = await authFetch(url);
       const data = await res.json();
 
       if (!res.ok || !data.ok) {
@@ -335,10 +401,8 @@ document.addEventListener('DOMContentLoaded', () => {
           const icon = isVideo ? '🎬' : isAudio ? '🎵' : '🖼️';
           const title = r.title || r.file_name || 'Archived Media';
           const dateStr = r.archived_at ? new Date(r.archived_at).toLocaleDateString() : '';
-          const previewUrl = `/api/file?file=${encodeURIComponent(r.file_name)}`;
-          const downloadUrl = `/api/file?file=${encodeURIComponent(r.file_name)}&download=1`;
-
-          const safePath = (r.file_name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+          const targetFile = r.relative_path || r.file_name || '';
+          const previewUrl = buildAuthorizedUrl(`/api/file?file=${encodeURIComponent(targetFile)}`);
 
           return `
             <div class="library-item">
@@ -353,10 +417,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 </div>
               </div>
               <div class="library-item-actions">
-                <button class="btn btn-sm btn-primary" onclick="previewMedia('${previewUrl}', '${escapeHtml(title)}', '${mediaType}')" title="Quickly view or play media">
+                <button type="button" class="btn btn-sm btn-primary" data-action="preview" data-url="${escapeHtml(previewUrl)}" data-title="${escapeHtml(title)}" data-type="${escapeHtml(mediaType)}" title="Quickly view or play media">
                   ▶ View
                 </button>
-                <button class="btn btn-sm btn-secondary" onclick="openFolder('${safePath}')" title="Open directory in Windows File Explorer">
+                <button type="button" class="btn btn-sm btn-secondary" data-action="open-folder" data-path="${escapeHtml(targetFile)}" title="Open directory in Windows File Explorer">
                   📂 Folder
                 </button>
               </div>
@@ -409,11 +473,20 @@ document.addEventListener('DOMContentLoaded', () => {
     modalTitle.textContent = title || 'Media Preview';
     modalBody.innerHTML = '';
 
-    const directDownloadBtn = `<div style="margin-top: 12px;"><a href="${url}&download=1" class="btn btn-sm btn-primary" download>⬇ Save to Device</a></div>`;
+    const authorizedPreviewUrl = buildAuthorizedUrl(url);
+    const downloadUrl = buildAuthorizedUrl(
+      authorizedPreviewUrl +
+        (authorizedPreviewUrl.includes('download=1')
+          ? ''
+          : authorizedPreviewUrl.includes('?')
+            ? '&download=1'
+            : '?download=1')
+    );
+    const directDownloadBtn = `<div style="margin-top: 12px;"><a href="${escapeHtml(downloadUrl)}" class="btn btn-sm btn-primary" download>⬇ Save to Device</a></div>`;
 
     if (type === 'video') {
       const video = document.createElement('video');
-      video.src = url;
+      video.src = authorizedPreviewUrl;
       video.controls = true;
       video.autoplay = true;
       video.style.maxWidth = '100%';
@@ -430,7 +503,7 @@ document.addEventListener('DOMContentLoaded', () => {
       modalBody.appendChild(video);
     } else if (type === 'audio') {
       const audio = document.createElement('audio');
-      audio.src = url;
+      audio.src = authorizedPreviewUrl;
       audio.controls = true;
       audio.autoplay = true;
       audio.onerror = () => {
@@ -445,7 +518,7 @@ document.addEventListener('DOMContentLoaded', () => {
       modalBody.appendChild(audio);
     } else {
       const img = document.createElement('img');
-      img.src = url;
+      img.src = authorizedPreviewUrl;
       img.alt = title || 'Image preview';
       img.style.maxWidth = '100%';
       img.style.maxHeight = '70vh';

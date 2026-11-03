@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { isValidDisplayTitle } from '../src/mediaHandler.js';
+import { isValidDisplayTitle, describeError } from '../src/mediaHandler.js';
 
 describe('mediaHandler', () => {
   describe('isValidDisplayTitle', () => {
@@ -31,6 +31,36 @@ describe('mediaHandler', () => {
       assert.strictEqual(isValidDisplayTitle(null), false);
       assert.strictEqual(isValidDisplayTitle(undefined), false);
       assert.strictEqual(isValidDisplayTitle(12345), false);
+    });
+  });
+
+  describe('describeError classification', () => {
+    it('classifies "No video could be found" as no downloadable media rather than deleted post', () => {
+      assert.strictEqual(
+        describeError(new Error('ERROR: [twitter] 2116421485594382571: No video could be found in this tweet')),
+        'no downloadable media found (or it exceeded the size limit)'
+      );
+      assert.strictEqual(
+        describeError(new Error('ERROR: no video formats found')),
+        'no downloadable media found (or it exceeded the size limit)'
+      );
+      assert.strictEqual(
+        describeError(new Error('YTDLP_NO_MEDIA_FOUND')),
+        'no downloadable media found (or it exceeded the size limit)'
+      );
+      assert.strictEqual(
+        describeError(new Error('GALLERYDL_NO_MEDIA_FOUND')),
+        'no downloadable media found (or it exceeded the size limit)'
+      );
+    });
+
+    it('still classifies genuine deleted/404 posts as post was not found or deleted', () => {
+      assert.strictEqual(describeError(new Error('Tweet could not be found')), 'post was not found or deleted');
+      assert.strictEqual(describeError(new Error('NotFoundError: status 404')), 'post was not found or deleted');
+      assert.strictEqual(
+        describeError(new Error('Unavailable')),
+        'post is unavailable (deleted, private, or age-restricted)'
+      );
     });
   });
 });

@@ -1,6 +1,7 @@
-import axios from 'axios';
+import { config } from './config.js';
+import { validateSsrfTarget, getBrowserHeaders } from './utils.js';
 
-const URL_REGEX = /https?:\/\/[^\s<>()\[\]"]+/gi;
+export const URL_REGEX = /https?:\/\/[^\s<>()\[\]"`\\]+/gi;
 
 const SHORTENER_HOSTS = new Set([
   't.co',
@@ -107,10 +108,23 @@ export function isKnownNsfwUrl(rawUrl) {
  * Evaluates whether platform metadata from gallery-dl or yt-dlp indicates NSFW / sensitive content.
  *
  * @param {object} meta - Parsed metadata object
+ * @param {number} [depth=0] - Internal recursion guard for nested post/tweet wrappers
  * @returns {boolean}
  */
-export function checkNsfwInMetadata(meta) {
+export function checkNsfwInMetadata(meta, depth = 0) {
   if (!meta || typeof meta !== 'object') return false;
+
+  // Generic explicit NSFW / adult flags (Imgur, Mastodon, Lemmy, RedGifs, Tumblr, etc.)
+  if (
+    meta.nsfw === true ||
+    meta.is_nsfw === true ||
+    meta.mature === true ||
+    meta.adult === true ||
+    meta.mature_content === true ||
+    meta.sexual === true
+  ) {
+    return true;
+  }
 
   // Twitter / X: possibly_sensitive: true, sensitive: true
   if (meta.possibly_sensitive === true || meta.sensitive === true) return true;
@@ -118,21 +132,27 @@ export function checkNsfwInMetadata(meta) {
   // Reddit: over_18: true, spoiler: true
   if (meta.over_18 === true || meta.spoiler === true) return true;
 
-  // Pixiv: x_restrict > 0 (1 = R-18, 2 = R-18G), age_limit >= 18
+  // Pixiv: x_restrict > 0 (1 = R-18, 2 = R-18G), age_limit >= 18 (yt-dlp universal age gate)
   if (typeof meta.x_restrict === 'number' && meta.x_restrict > 0) return true;
   if (typeof meta.age_limit === 'number' && meta.age_limit >= 18) return true;
 
-  // Boorus (Danbooru, Gelbooru, etc.): rating = 'e', 'q', 'explicit', 'questionable'
+  // Boorus & art sites: rating = 'e', 'q', 'explicit', 'questionable', 'r18', 'nsfw', 'adult', 'mature'
   if (typeof meta.rating === 'string') {
-    const r = meta.rating.toLowerCase();
-    if (['e', 'q', 'explicit', 'questionable'].includes(r)) return true;
+    const r = meta.rating.toLowerCase().trim();
+    if (
+      ['e', 'q', 'explicit', 'questionable', 'r18', 'r-18', 'r-18g', 'nsfw', 'adult', 'mature', 'xxx', '18+'].includes(
+        r
+      )
+    ) {
+      return true;
+    }
   }
 
-  // Bluesky: labels array containing "sexual", "nudity", "porn", "nsfw"
+  // Bluesky / ATProto: labels array containing "sexual", "nudity", "porn", "nsfw", "graphic-media", "gore", "adult"
   if (Array.isArray(meta.labels)) {
-    const nsfwLabels = new Set(['sexual', 'nudity', 'porn', 'nsfw']);
+    const nsfwLabels = new Set(['sexual', 'nudity', 'porn', 'nsfw', 'graphic-media', 'gore', 'adult']);
     for (const label of meta.labels) {
-      const val = (typeof label === 'string' ? label : label?.val || label?.value || '').toLowerCase();
+      const val = (typeof label === 'string' ? label : label?.val || label?.value || '').toLowerCase().trim();
       if (nsfwLabels.has(val)) return true;
     }
   }
@@ -140,20 +160,54 @@ export function checkNsfwInMetadata(meta) {
   // DeviantArt: is_mature: true
   if (meta.is_mature === true) return true;
 
-  // Tags check: "R-18", "R-18G", "NSFW", "18+", "explicit"
+  // Tags check: "R-18", "R-18G", "NSFW", "18+", "explicit", "uncensored", "hentai" (strings or { name } objects)
   const tags = Array.isArray(meta.tags)
     ? meta.tags
     : typeof meta.tags === 'string'
       ? meta.tags.split(/[\s,]+/)
       : [];
 
-  const nsfwTags = new Set(['r-18', 'r-18g', 'r18', 'r18g', 'nsfw', '18+', 'explicit']);
+  const nsfwTags = new Set(['r-18', 'r-18g', 'r18', 'r18g', 'nsfw', '18+', 'explicit', 'uncensored', 'hentai']);
   for (const tag of tags) {
-    const t = String(tag).toLowerCase().trim();
+    const rawTag = typeof tag === 'object' && tag !== null ? (tag.name || tag.tag || tag.value || '') : tag;
+    const t = String(rawTag).toLowerCase().trim();
     if (nsfwTags.has(t)) return true;
   }
 
+  // Check common nested post wrappers emitted by gallery-dl / yt-dlp
+  if (depth < 1) {
+    for (const key of ['tweet', 'post', 'illust', 'submission']) {
+      if (meta[key] && typeof meta[key] === 'object' && checkNsfwInMetadata(meta[key], depth + 1)) {
+        return true;
+      }
+    }
+  }
+
   return false;
+}
+
+/**
+ * Evaluates whether a downloaded media item should be uploaded to Discord with spoiler blurring.
+ *
+ * @param {object} params
+ * @param {boolean} [params.isDownloadedNsfw=false]
+ * @param {boolean} [params.isKnownNsfw=false]
+ * @param {string} [params.url='']
+ * @param {boolean} [params.isUserSpoiler=false]
+ * @param {boolean} [params.isChannelNsfw=false]
+ * @returns {boolean}
+ */
+export function shouldSpoilerMedia({
+  isDownloadedNsfw = false,
+  isKnownNsfw = false,
+  url = '',
+  isUserSpoiler = false,
+  isChannelNsfw = false,
+} = {}) {
+  const spoilerByUser = Boolean(isUserSpoiler && config.spoilerUserFlaggedLinks);
+  const isNsfwMedia = Boolean((isDownloadedNsfw || isKnownNsfw || isKnownNsfwUrl(url)) && config.autoSpoilerNsfw);
+  const spoilerByNsfw = isNsfwMedia && (!config.spoilerNonNsfwChannelsOnly || !isChannelNsfw);
+  return spoilerByUser || spoilerByNsfw;
 }
 
 const TRACKING_PARAMS = new Set([
@@ -181,9 +235,10 @@ const TRACKING_PARAMS = new Set([
 ]);
 
 export function stripQueryAndTrailingPunctuation(rawUrl) {
-  // Strip common trailing punctuation that gets swept up by the regex
-  // (e.g. a link at the end of a sentence followed by a period, brackets, wrapping quotes, or spoiler pipes).
-  return rawUrl.replace(/[.,!?;:)'"|]+$/g, '');
+  if (!rawUrl || typeof rawUrl !== 'string') return '';
+  // Strip common trailing punctuation, backslashes, angle brackets, and Discord markdown delimiters (` * ~)
+  // while preserving valid mid-URL RFC 3986 characters (~, *) and signed query parameter ordering.
+  return rawUrl.trim().replace(/[.,!?;:)'"|\\`*~<>]+$/g, '');
 }
 
 function getExtension(pathname) {
@@ -499,6 +554,17 @@ export function extractPlatformMediaId(rawUrl) {
       const id = pathname.slice(1).split('/')[0];
       if (id) return `deviantart:stash:${id}`;
     }
+
+    // Discord CDN / Media attachments: /attachments/<channelId>/<attachmentId>/<filename>
+    if (
+      host === 'cdn.discordapp.com' ||
+      host === 'media.discordapp.net' ||
+      host.endsWith('.discordapp.com') ||
+      host.endsWith('.discordapp.net')
+    ) {
+      const match = pathname.match(/^\/attachments\/\d+\/(\d+)\//i);
+      if (match) return `discord:${match[1]}`;
+    }
   } catch {}
 
   return null;
@@ -556,7 +622,7 @@ export function isDeviantArtUrl(rawUrl) {
 
 /**
  * Fast resolution of known URL shorteners (e.g. t.co, bit.ly, pin.it, vt.tiktok.com)
- * Uses HEAD request with timeout, falling back to streamed GET if HEAD is rejected (405/403).
+ * Uses native `fetch` with manual hop-by-hop redirect resolution and SSRF checks.
  */
 export async function resolveShortUrl(rawUrl) {
   if (!rawUrl) return rawUrl;
@@ -567,59 +633,64 @@ export async function resolveShortUrl(rawUrl) {
       return rawUrl;
     }
 
-    const headers = {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    };
+    const headers = getBrowserHeaders(rawUrl, {
+      fetchDest: 'document',
+      fetchMode: 'navigate',
+    });
 
     // fav.me does not listen on HTTPS port 443 and DeviantArt destination blocks automated HEAD requests.
-    // Reading the Location header via HTTP with maxRedirects: 0 unshortens in ~150ms cleanly.
     if (host === 'fav.me') {
-      try {
-        const httpUrl = rawUrl.replace(/^https:\/\//i, 'http://');
-        const res = await axios.get(httpUrl, {
-          maxRedirects: 0,
-          timeout: 3000,
-          headers,
-          validateStatus: (s) => (s >= 300 && s < 400) || (s >= 200 && s < 300),
-        });
-        const loc = res.headers?.location;
-        if (loc) return loc;
-      } catch (favErr) {
-        const loc = favErr.response?.headers?.location;
-        if (loc) return loc;
+      const httpUrl = rawUrl.replace(/^https:\/\//i, 'http://');
+      await validateSsrfTarget(httpUrl);
+      const res = await fetch(httpUrl, {
+        method: 'GET',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(3000),
+        headers,
+      });
+      await res.body?.cancel().catch(() => {});
+      const loc = res.headers.get('location');
+      if (loc) {
+        const resolved = new URL(loc, httpUrl).toString();
+        await validateSsrfTarget(resolved);
+        return resolved;
       }
       return rawUrl;
     }
 
-    try {
-      const res = await axios.head(rawUrl, {
-        maxRedirects: 5,
-        timeout: 3500,
+    let currentUrl = rawUrl;
+    let method = 'HEAD';
+    const maxHops = 5;
+
+    for (let hop = 0; hop < maxHops; hop++) {
+      await validateSsrfTarget(currentUrl);
+      const res = await fetch(currentUrl, {
+        method,
+        redirect: 'manual',
+        signal: AbortSignal.timeout(3500),
         headers,
-        validateStatus: (status) => status >= 200 && status < 400,
       });
-      const finalUrl = res.request?.res?.responseUrl || res.config?.url;
-      if (finalUrl && finalUrl !== rawUrl) {
-        return finalUrl;
+      await res.body?.cancel().catch(() => {});
+
+      if ([301, 302, 303, 307, 308].includes(res.status)) {
+        const loc = res.headers.get('location');
+        if (!loc) break;
+        currentUrl = new URL(loc, currentUrl).toString();
+        continue;
       }
-    } catch (headErr) {
-      // Fallback: If server rejects HEAD with 405 (Method Not Allowed), 403, or 400, try streamed GET
-      const status = headErr?.response?.status;
-      if (status === 405 || status === 403 || status === 400) {
-        const res = await axios.get(rawUrl, {
-          maxRedirects: 5,
-          timeout: 3500,
-          responseType: 'stream',
-          headers,
-          validateStatus: (s) => s >= 200 && s < 400,
-        });
-        const finalUrl = res.request?.res?.responseUrl || res.config?.url;
-        res.data?.destroy?.();
-        if (finalUrl && finalUrl !== rawUrl) {
-          return finalUrl;
-        }
+
+      if (method === 'HEAD' && (res.status === 405 || res.status === 403 || res.status === 400)) {
+        method = 'GET';
+        hop--;
+        continue;
       }
+
+      break;
+    }
+
+    if (currentUrl && currentUrl !== rawUrl) {
+      await validateSsrfTarget(currentUrl);
+      return currentUrl;
     }
   } catch {}
   return rawUrl;
@@ -753,6 +824,109 @@ export async function extractMediaLinksAsync(content) {
   return results;
 }
 
+const ATTACHMENT_MEDIA_EXTENSIONS = new Set([
+  ...DIRECT_MEDIA_EXTENSIONS,
+  'avif',
+  'flv',
+  'wmv',
+]);
+
+/**
+ * Evaluates whether a Discord message Attachment object represents media
+ * (image, video, GIF, or audio) while rejecting non-media uploads (.zip, .pdf, .txt, .svg, code files).
+ *
+ * @param {object} att
+ * @returns {boolean}
+ */
+export function isMediaAttachment(att) {
+  if (!att || typeof att !== 'object') return false;
+  const url = att.url || att.proxyURL;
+  if (!url || typeof url !== 'string' || !/^https?:\/\//i.test(url)) return false;
+
+  const rawMime = typeof att.contentType === 'string' ? att.contentType.split(';')[0].trim().toLowerCase() : '';
+  if (rawMime) {
+    if (rawMime === 'image/svg+xml') return false;
+    if (rawMime.startsWith('image/') || rawMime.startsWith('video/') || rawMime.startsWith('audio/')) {
+      return true;
+    }
+    if (rawMime !== 'application/octet-stream') {
+      return false;
+    }
+  }
+
+  let ext = null;
+  if (typeof att.name === 'string' && att.name) {
+    ext = getExtension(att.name);
+  }
+  if (!ext) {
+    try {
+      ext = getExtension(new URL(url).pathname);
+    } catch {}
+  }
+  return Boolean(ext && ATTACHMENT_MEDIA_EXTENSIONS.has(ext));
+}
+
+/**
+ * Extracts user-uploaded Discord media attachments from a message for local backup & deduplication.
+ * Marks extracted items with `archiveOnly: true` so the bot backs them up silently without re-uploading a copy.
+ *
+ * @param {import('discord.js').Message|object} message
+ * @returns {Array<{
+ *   url: string,
+ *   type: 'direct',
+ *   archiveOnly: true,
+ *   isUserAttachment: true,
+ *   mediaId: string|null,
+ *   filename: string|undefined,
+ *   isSpoiler: boolean,
+ *   isKnownNsfw: false
+ * }>}
+ */
+export function extractMessageAttachments(message) {
+  if (!config.archiveUserAttachments || !message?.attachments) return [];
+  const rawCollection = message.attachments;
+  const list =
+    typeof rawCollection.values === 'function'
+      ? Array.from(rawCollection.values())
+      : Array.isArray(rawCollection)
+        ? rawCollection
+        : [];
+
+  const results = [];
+  const seenKeys = new Set();
+
+  for (const att of list) {
+    if (!isMediaAttachment(att)) continue;
+    const url = stripQueryAndTrailingPunctuation(att.url || att.proxyURL);
+    const mediaId = att.id ? `discord:${att.id}` : extractPlatformMediaId(url);
+    const dedupeKey = mediaId || url;
+    if (seenKeys.has(dedupeKey)) continue;
+    seenKeys.add(dedupeKey);
+
+    let rawFilename = typeof att.name === 'string' && att.name.trim() ? att.name.trim() : '';
+    if (!rawFilename) {
+      try {
+        rawFilename = decodeURIComponent(new URL(url).pathname.split('/').pop() || '');
+      } catch {}
+    }
+    const isSpoiler = Boolean(att.spoiler || /^SPOILER_/i.test(rawFilename));
+    const cleanFilename = rawFilename.replace(/^(?:SPOILER_)+/i, '') || rawFilename || undefined;
+
+    results.push({
+      url,
+      type: 'direct',
+      archiveOnly: true,
+      isUserAttachment: true,
+      mediaId: mediaId || null,
+      filename: cleanFilename,
+      isSpoiler,
+      isKnownNsfw: false,
+    });
+  }
+
+  return results;
+}
+
 /**
  * Checks if a URL is a YouTube playlist or a video that is part of a playlist.
  * Returns details about the playlist/video.
@@ -763,9 +937,10 @@ export async function extractMediaLinksAsync(content) {
 export function extractYouTubePlaylistDetails(rawUrl) {
   const result = { isPlaylist: false, isVideoWithPlaylist: false, videoId: null, listId: null };
   if (!rawUrl) return result;
+  const cleaned = stripQueryAndTrailingPunctuation(String(rawUrl).trim());
 
   try {
-    const parsed = new URL(rawUrl);
+    const parsed = new URL(cleaned);
     const host = parsed.hostname.toLowerCase().replace(/^(www\.|m\.)/, '');
 
     if (host === 'youtube.com' || host === 'music.youtube.com' || host === 'youtu.be') {

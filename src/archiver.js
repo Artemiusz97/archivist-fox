@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { AttachmentBuilder } from 'discord.js';
 import { config } from './config.js';
-import { sanitizePathSegment } from './utils.js';
+import { sanitizePathSegment, runProcess } from './utils.js';
 
 /**
  * Resolves subfolder relative path based on user's configured format.
@@ -100,8 +101,9 @@ export async function archiveLocalMedia(sourceFilePath, context = {}) {
             meta.postedBy = meta.postedBy || context.author || null;
             meta.channel = meta.channel || context.channel || null;
             meta.fileName = targetBasename;
-            meta.relativePath = path.relative(rootDir, destPath);
+            meta.relativePath = path.relative(rootDir, destPath).split(path.sep).join('/');
             meta.fileSizeBytes = destStat.size;
+            if (context.isNsfw) meta.isNsfw = true;
             await fs.promises.writeFile(metadataPath, JSON.stringify(meta, null, 2), 'utf-8');
           } catch {}
         }
@@ -159,9 +161,10 @@ export async function archiveLocalMedia(sourceFilePath, context = {}) {
         originalUrl: context.url || null,
         postedBy: context.author || null,
         channel: context.channel || null,
+        isNsfw: Boolean(context.isNsfw),
         archivedAt: new Date().toISOString(),
         fileName: targetBasename,
-        relativePath: path.relative(rootDir, destPath),
+        relativePath: path.relative(rootDir, destPath).split(path.sep).join('/'),
         fileSizeBytes: (await fs.promises.stat(destPath)).size,
       };
       if (context.companionFiles && Array.isArray(context.companionFiles) && context.companionFiles.length > 0) {
@@ -207,4 +210,129 @@ export async function archiveLocalMedia(sourceFilePath, context = {}) {
     console.error('[Archiver] Failed to save local media archive:', err);
     return null;
   }
+}
+
+/**
+ * Reads the `.json` sidecar metadata saved next to a local archived media file, if present.
+ *
+ * @param {string|null} archivedFilePath
+ * @returns {Promise<object|null>}
+ */
+export async function readArchivedSidecar(archivedFilePath) {
+  if (!archivedFilePath) return null;
+  const metaPath = `${archivedFilePath}.json`;
+  try {
+    if (!fs.existsSync(metaPath)) return null;
+    return JSON.parse(await fs.promises.readFile(metaPath, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Builds a clean, Windows-safe subtitle filename preserving the language tag
+ * (e.g. `Video Title.en.srt`).
+ *
+ * @param {string} subPath
+ * @param {string} [baseTitle]
+ * @returns {string}
+ */
+export function getCleanSubtitleFilename(subPath, baseTitle = '') {
+  const ext = path.extname(subPath).toLowerCase() || '.srt';
+  const rawBase = path.basename(subPath, ext);
+  const langMatch = rawBase.match(/(?:^|[._-])([a-zA-Z]{2,3}(?:-[A-Za-z0-9]{2,8})?)$/);
+  const langSuffix = langMatch ? `.${langMatch[1]}` : '';
+  const stemSource = baseTitle || (langMatch ? rawBase.slice(0, rawBase.length - langMatch[0].length) : rawBase);
+  const safeStem = sanitizePathSegment(stemSource || 'subtitles', 80, 'subtitles');
+  return `${safeStem}${langSuffix}${ext}`;
+}
+
+/**
+ * Prepares Discord `AttachmentBuilder` items for downloaded subtitle sidecars.
+ * Uses asynchronous `runProcess('tar', ...)` when zipping many language tracks
+ * so the Node.js event loop and Discord gateway heartbeat never block.
+ *
+ * @param {string[]} subtitleFiles
+ * @param {string} cleanTitle
+ * @param {string} tempDir
+ * @param {boolean} [shouldSpoiler=false]
+ * @param {AbortSignal|null} [signal=null]
+ * @returns {Promise<AttachmentBuilder[]>}
+ */
+export async function prepareSubtitleAttachments(
+  subtitleFiles,
+  cleanTitle,
+  tempDir,
+  shouldSpoiler = false,
+  signal = null
+) {
+  if (!config.uploadSubtitlesToDiscord || !Array.isArray(subtitleFiles) || subtitleFiles.length === 0) {
+    return [];
+  }
+
+  const validSubs = [];
+  for (const subPath of subtitleFiles) {
+    try {
+      const stat = await fs.promises.stat(subPath);
+      if (stat.size > 0 && stat.size <= config.maxFileSizeBytes) {
+        validSubs.push(subPath);
+      }
+    } catch {}
+  }
+
+  if (validSubs.length === 0) return [];
+
+  // Prioritize English subtitle tracks first (e.g. .en.srt, .en-US.srt)
+  const enRegex = /(?:^|[._-])en(?:[-_][a-zA-Z0-9]+)?\.(?:srt|vtt|ass)$/i;
+  validSubs.sort((a, b) => {
+    const aEn = enRegex.test(path.basename(a)) ? 0 : 1;
+    const bEn = enRegex.test(path.basename(b)) ? 0 : 1;
+    return aEn - bEn;
+  });
+
+  const maxIndividual = config.maxIndividualSubtitles || 3;
+  if (config.zipMultiSubtitles && validSubs.length > maxIndividual && tempDir) {
+    const stageDir = path.join(tempDir, `subs-${Date.now()}`);
+    try {
+      await fs.promises.mkdir(stageDir, { recursive: true });
+      const stagedNames = [];
+      for (const subPath of validSubs) {
+        const cleanName = getCleanSubtitleFilename(subPath, cleanTitle);
+        await fs.promises.copyFile(subPath, path.join(stageDir, cleanName));
+        stagedNames.push(cleanName);
+      }
+      const safeStem = sanitizePathSegment(cleanTitle || 'subtitles', 75, 'subtitles');
+      const zipBaseName = `${safeStem}_subtitles.zip`;
+      const zipPath = path.join(tempDir, zipBaseName);
+
+      await runProcess('tar', ['-a', '-c', '-f', zipPath, ...stagedNames], {
+        cwd: stageDir,
+        timeoutMs: 30000,
+        signal,
+        registerProcess: false,
+      });
+
+      const zipStat = await fs.promises.stat(zipPath).catch(() => null);
+      if (zipStat && zipStat.size > 0 && zipStat.size <= config.maxFileSizeBytes) {
+        const attachment = new AttachmentBuilder(zipPath, { name: zipBaseName });
+        if (shouldSpoiler) {
+          attachment.setSpoiler(true);
+        }
+        return [attachment];
+      }
+    } catch {
+      // Fall back to attaching up to maxIndividual subtitle files individually
+    }
+  }
+
+  const attachments = [];
+  for (const subPath of validSubs.slice(0, maxIndividual)) {
+    const cleanName = getCleanSubtitleFilename(subPath, cleanTitle);
+    const attachment = new AttachmentBuilder(subPath, { name: cleanName });
+    if (shouldSpoiler) {
+      attachment.setSpoiler(true);
+    }
+    attachments.push(attachment);
+  }
+  return attachments;
 }

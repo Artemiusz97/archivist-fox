@@ -3,24 +3,44 @@ import path from 'node:path';
 import os from 'node:os';
 import { ChannelType, PermissionFlagsBits, AttachmentBuilder } from 'discord.js';
 import { config, isChannelAllowed, isLinkBackupChannel } from './config.js';
-import { extractMediaLinksAsync, extractAllUrlsAsync, normalizeUrl, extractPlatformMediaId, isDeviantArtUrl } from './urlExtractor.js';
+import {
+  extractMediaLinksAsync,
+  extractMessageAttachments,
+  extractAllUrlsAsync,
+  normalizeUrl,
+  extractPlatformMediaId,
+  shouldSpoilerMedia,
+} from './urlExtractor.js';
 import { downloadDirect } from './directDownloader.js';
-import { downloadWithYtDlp } from './ytdlpDownloader.js';
-import { downloadWithGalleryDl } from './galleryDlDownloader.js';
-import { archiveLocalMedia } from './archiver.js';
-import { computeMediaFingerprint, isVideoFile, isAudioFile } from './phasher.js';
-import { saveRecord, findDuplicateByUrl, findDuplicate } from './db.js';
-import { saveLinkRecord, findDuplicateLink } from './linkDb.js';
-import { ensureWithinLimit, isValidDisplayTitle } from './mediaHandler.js';
-import { applyThumbnailPreview } from './thumbnailPreview.js';
+import { downloadPlatformMedia } from './downloaderCore.js';
+import { archiveLocalMedia, prepareSubtitleAttachments, readArchivedSidecar } from './archiver.js';
+import { computeMediaFingerprint } from './phasher.js';
+import { saveRecordBatch, findDuplicateByUrl, findDuplicate } from './db.js';
+import { saveLinkRecordBatch, findDuplicateLink } from './linkDb.js';
+import { ensureWithinLimit } from './compress.js';
+import { applyThumbnailPreview, findThumbnailFile } from './thumbnailPreview.js';
 import { processDualFormatMedia } from './gifHandler.js';
 import { downloadQueue } from './queue.js';
 import { isPlaylistDownloading } from './playlistHandler.js';
 import { isRestoreRunning, requestRestoreStop } from './linkRestorer.js';
-import { scheduleAutoDelete, killAllDownloadProcesses, isAbortError, sleep } from './utils.js';
+import {
+  scheduleAutoDelete,
+  killAllDownloadProcesses,
+  isAbortError,
+  safeReply,
+  formatDiscordAuthor,
+  isModeratorOrOwner,
+  isVideo,
+  isAudio,
+  formatMediaMessageContent,
+  isStopRequested,
+  requestStop,
+  clearStopRequested,
+} from './utils.js';
+
+export { isStopRequested, requestStop, clearStopRequested };
 
 let isScanningActive = false;
-let isScanStopRequested = false;
 let scanAbortController = null;
 let activeScanDownloads = 0;
 
@@ -28,22 +48,14 @@ export function isScanRunning() {
   return isScanningActive;
 }
 
-export function isStopRequested() {
-  return isScanStopRequested;
-}
-
 export function setScanRunning(val) {
   isScanningActive = Boolean(val);
-  isScanStopRequested = false;
-}
-
-export function clearStopRequested() {
-  isScanStopRequested = false;
+  clearStopRequested();
 }
 
 export function requestScanStop() {
   if (isScanningActive) {
-    isScanStopRequested = true;
+    requestStop();
     if (scanAbortController) {
       try {
         scanAbortController.abort();
@@ -58,7 +70,7 @@ export function stopActiveTasks() {
   const scanRunning = isScanningActive;
   const playlistRunning = isPlaylistDownloading();
   const restoreRunning = isRestoreRunning();
-  isScanStopRequested = true;
+  requestStop();
   if (scanAbortController) {
     try {
       scanAbortController.abort();
@@ -70,6 +82,47 @@ export function stopActiveTasks() {
   const activeDownloadsStopped = Math.max(activeStopped, killedProcCount, activeScanDownloads);
   const queueItemsCleared = queueCleared;
   return { scanRunning, playlistRunning, restoreRunning, queueItemsCleared, activeDownloadsStopped };
+}
+
+/**
+ * Formats the summary returned by `stopActiveTasks()` for `/stop` and `!stop`.
+ */
+export function formatStopSummary(stopped = {}) {
+  const hasActiveTasks = Boolean(
+    stopped.scanRunning ||
+    stopped.playlistRunning ||
+    stopped.restoreRunning ||
+    (stopped.queueItemsCleared || 0) > 0 ||
+    (stopped.activeDownloadsStopped || 0) > 0
+  );
+
+  let message;
+  if (hasActiveTasks) {
+    message = '🛑 **Stopped active tasks:**\n';
+    if (stopped.scanRunning) message += '• Aborted active channel rescan / media crawl.\n';
+    if (stopped.restoreRunning) message += '• Aborted active link restoration / reposting.\n';
+    if (stopped.playlistRunning) message += '• Aborted active playlist download.\n';
+    if (stopped.activeDownloadsStopped > 0) {
+      message += `• Aborted **${stopped.activeDownloadsStopped}** download(s) in progress.\n`;
+    }
+    if (stopped.queueItemsCleared > 0) {
+      message += `• Cleared **${stopped.queueItemsCleared}** queued download(s).\n`;
+    }
+    message = message.trimEnd();
+  } else {
+    message = 'ℹ️ No active downloads, rescan, playlist download, restoration, or queued tasks are currently running.';
+  }
+
+  return {
+    hasActiveTasks,
+    message,
+    toString() {
+      return message;
+    },
+    [Symbol.toPrimitive]() {
+      return message;
+    },
+  };
 }
 
 /**
@@ -140,103 +193,6 @@ export function parseRescanArgs(content, currentChannel) {
 }
 
 /**
- * Downloads a platform or direct media link with automatic retries for transient errors.
- * DeviantArt has no yt-dlp extractor and is routed directly to gallery-dl.
- */
-async function downloadMedia(link, destDir, maxRetries = 2, signal = null) {
-  let lastErr = null;
-
-  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
-    if (signal?.aborted) {
-      throw new Error('DOWNLOAD_ABORTED');
-    }
-    try {
-      if (link.type === 'direct') {
-        const filePath = await downloadDirect(link.url, destDir, config.hardCapBytes, { signal });
-        return [filePath];
-      }
-
-      // DeviantArt fast-path: yt-dlp has no DeviantArt extractor, go straight to gallery-dl.
-      if (isDeviantArtUrl(link.url)) {
-        try {
-          return await downloadWithGalleryDl(link.url, destDir, { signal });
-        } catch (err) {
-          if (isAbortError(err) || signal?.aborted) {
-            throw err;
-          }
-          lastErr = err;
-          const isTransient =
-            err?.message?.includes('TIMEOUT') ||
-            err?.message?.includes('429') ||
-            err?.message?.includes('rate limit') ||
-            err?.message?.includes('ECONNRESET') ||
-            err?.message?.includes('ETIMEDOUT');
-
-        if (isTransient && attempt <= maxRetries) {
-          console.warn(
-            `[Scanner] DeviantArt download of <${link.url}> hit transient error (${err.message}), retrying attempt ${attempt + 1}/${maxRetries + 1}...`
-          );
-          await sleep(attempt * 3000, signal);
-          continue;
-        }
-        throw err;
-      }
-    }
-
-      try {
-        return await downloadWithYtDlp(link.url, destDir, { signal });
-      } catch (ytErr) {
-        if (isAbortError(ytErr) || signal?.aborted) {
-          throw ytErr;
-        }
-        const msg = ytErr?.message || '';
-        if (msg.startsWith('COMMAND_NOT_FOUND')) {
-          throw ytErr;
-        }
-        try {
-          return await downloadWithGalleryDl(link.url, destDir, { signal });
-        } catch (galleryErr) {
-          if (isAbortError(galleryErr) || signal?.aborted) {
-            throw galleryErr;
-          }
-          if (galleryErr?.message?.includes('Unsupported URL')) {
-            lastErr = ytErr;
-          } else {
-            lastErr = galleryErr;
-          }
-
-          const isTransient =
-            lastErr?.message?.includes('TIMEOUT') ||
-            lastErr?.message?.includes('429') ||
-            lastErr?.message?.includes('rate limit') ||
-            lastErr?.message?.includes('ECONNRESET') ||
-            lastErr?.message?.includes('ETIMEDOUT');
-
-          if (isTransient && attempt <= maxRetries) {
-            console.warn(
-              `[Scanner] Download of <${link.url}> hit rate-limit/timeout (${lastErr.message}), retrying attempt ${attempt + 1}/${maxRetries + 1}...`
-            );
-            await sleep(attempt * 3000, signal);
-            continue;
-          }
-        }
-      }
-    } catch (err) {
-      if (isAbortError(err) || signal?.aborted) {
-        throw err;
-      }
-      lastErr = err;
-      if (attempt <= maxRetries) {
-        await sleep(attempt * 3000, signal);
-        continue;
-      }
-    }
-  }
-
-  throw lastErr || new Error('Download failed');
-}
-
-/**
  * Tracks download speed, item throughput, and ETA during channel crawling.
  */
 class CrawlSpeedTracker {
@@ -300,10 +256,28 @@ function truncateUrl(url, maxLen = 65) {
   return url.slice(0, maxLen - 3) + '...';
 }
 
+function resolveArchivedFilePath(existing, archiveRoot, channelName) {
+  if (!existing) return null;
+  const candidates = [];
+  if (existing.relativePath) {
+    candidates.push(path.join(archiveRoot, existing.relativePath));
+  }
+  if (existing.fileName) {
+    if (existing.channel) {
+      candidates.push(path.join(archiveRoot, existing.channel, existing.fileName));
+    }
+    candidates.push(path.join(archiveRoot, channelName, existing.fileName));
+    candidates.push(path.join(archiveRoot, existing.fileName));
+  }
+  for (const cp of candidates) {
+    if (fs.existsSync(cp)) return cp;
+  }
+  return null;
+}
+
 /**
  * Crawls a single Discord text channel, fetching messages in batches of 100,
  * extracting media links, archiving them to PC, and optionally reposting missing attachments.
- * Uses a pipelined producer-consumer model to download and archive concurrently.
  */
 export async function crawlChannel(channel, options = {}, onProgress = null) {
   const stats = {
@@ -322,6 +296,7 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
   const repliedWithAttachmentMessageIds = new Set();
   const channelUploadedMediaKeys = new Set();
   const concurrency = options.concurrency || config.scannerConcurrency || 3;
+  const archiveRoot = path.resolve(config.archiveDirectory);
 
   const workQueue = [];
   const candidateMessages = [];
@@ -333,26 +308,27 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
   scanAbortController = new AbortController();
   console.log(`[Scanner] 🚀 Crawl started for #${channel.name} (Concurrency: ${concurrency} workers)`);
 
-  // Worker Loop
+  // Worker Loop (spawned once candidateMessages are queued in chronological order)
   const workerLoop = async (workerId) => {
-    while (true) {
-      if (isScanStopRequested) {
+    while (workQueue.length > 0) {
+      if (isStopRequested()) {
         console.log(`[Scanner] [W${workerId}] 🛑 Stop requested. Worker exiting...`);
         break;
       }
 
-      if (workQueue.length === 0) {
-        if (isFetchingDone) break;
-        await new Promise((r) => setTimeout(r, 100)); // Wait for producer
-        continue;
-      }
-
       const message = workQueue.shift();
-      if (message.author.bot) continue;
+      if (!message || message.author.bot) continue;
 
-      // 1. General duplicate link detector & Link Backup indexing
-      if (config.enableGeneralDuplicateDetector || isLinkBackupChannel(channel)) {
+      const isBackupChan = isLinkBackupChannel(channel);
+      const authorTag = formatDiscordAuthor(message.author);
+      const authorId = message.author?.id || '0';
+      const postedAt = message.createdTimestamp || Date.now();
+      const channelName = channel.name || 'chat';
+
+      // 1. General duplicate link detector & Link Backup batch indexing
+      if (config.enableGeneralDuplicateDetector || isBackupChan) {
         const allUrls = await extractAllUrlsAsync(message.content);
+        const linksToSave = [];
         for (const { originalUrl, normalizedUrl } of allUrls) {
           const { isDuplicate } = findDuplicateLink(normalizedUrl, {
             scope: config.duplicateLinkScope,
@@ -360,22 +336,26 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
             channelId: channel.id,
           });
           if (!isDuplicate) {
-            if (isLinkBackupChannel(channel)) {
-              saveLinkRecord({
-                normalizedUrl,
-                originalUrl,
-                guildId: channel.guildId || null,
-                channelId: channel.id,
-                channelName: channel.name || 'chat',
-                messageId: message.id,
-                authorId: message.author?.id || '0',
-                authorTag: message.author?.tag || message.author?.username || 'Unknown',
-                postedAt: message.createdTimestamp || Date.now(),
-                content: message.content || null,
-              });
+            linksToSave.push({
+              normalizedUrl,
+              originalUrl,
+              guildId: channel.guildId || null,
+              channelId: channel.id,
+              channelName,
+              messageId: message.id,
+              authorId,
+              authorTag,
+              postedAt,
+              content: message.content || null,
+              isBackup: isBackupChan,
+            });
+            if (isBackupChan) {
               stats.linksBackedUp++;
             }
           }
+        }
+        if (linksToSave.length > 0) {
+          saveLinkRecordBatch(linksToSave);
         }
       }
 
@@ -388,7 +368,9 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
         continue;
       }
 
-      const links = await extractMediaLinksAsync(message.content);
+      const textLinks = await extractMediaLinksAsync(message.content);
+      const attachmentLinks = config.enableLocalArchive ? extractMessageAttachments(message) : [];
+      const links = [...textLinks, ...attachmentLinks];
       if (links.length === 0) continue;
 
       const hasBotAttachment = repliedWithAttachmentMessageIds.has(message.id);
@@ -399,13 +381,15 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
 
       try {
         for (const link of links) {
-          if (isScanStopRequested) break;
+          if (isStopRequested()) break;
           stats.mediaLinksFound++;
           const normalized = normalizeUrl(link.url);
-          const platformMediaId = extractPlatformMediaId(link.url);
+          const platformMediaId = link.mediaId || extractPlatformMediaId(link.url);
+          const itemShouldUploadToDiscord = !link.archiveOnly && shouldUploadToDiscord;
+          const lockKey = platformMediaId || normalized || link.url;
 
           // If this message ALREADY has bot attachments in Discord, record its keys so duplicate posts won't re-upload
-          if (hasBotAttachment) {
+          if (hasBotAttachment && !link.archiveOnly) {
             if (normalized) channelUploadedMediaKeys.add(normalized);
             if (platformMediaId) channelUploadedMediaKeys.add(platformMediaId);
             channelUploadedMediaKeys.add(link.url);
@@ -413,7 +397,7 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
 
           // Check if this link is a duplicate of an earlier post in this channel/guild
           let isDuplicateOfEarlierPost = false;
-          if (config.enableDuplicatePrevention || config.enableGeneralDuplicateDetector) {
+          if (!link.archiveOnly && (config.enableDuplicatePrevention || config.enableGeneralDuplicateDetector)) {
             if (normalized && channelUploadedMediaKeys.has(normalized)) {
               isDuplicateOfEarlierPost = true;
             } else if (platformMediaId && channelUploadedMediaKeys.has(platformMediaId)) {
@@ -430,7 +414,7 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
                 linkDup.isDuplicate &&
                 linkDup.record &&
                 linkDup.record.message_id !== message.id &&
-                linkDup.record.posted_at < (message.createdTimestamp || Date.now())
+                linkDup.record.posted_at < postedAt
               ) {
                 isDuplicateOfEarlierPost = true;
               }
@@ -448,8 +432,8 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
           }
 
           // Fast skip if already indexed in database AND we are not uploading to Discord
-          if (!options.force && !shouldUploadToDiscord && normalized) {
-            const existing = await findDuplicateByUrl(link.url);
+          if (!options.force && !itemShouldUploadToDiscord && (normalized || platformMediaId)) {
+            const existing = await findDuplicateByUrl(link.url, platformMediaId);
             if (existing) {
               stats.skippedCount++;
               speedTracker.recordItem();
@@ -458,35 +442,21 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
             }
           }
 
-          // Concurrency lock for exact same URL
-          if (normalized) {
-            if (inFlightUrls.has(normalized)) {
+          // Concurrency lock for exact same media ID / URL
+          if (lockKey) {
+            if (inFlightUrls.has(lockKey)) {
               stats.skippedCount++;
               speedTracker.recordItem();
               console.log(`[Scanner] [W${workerId}] ⏭️ Skipped (duplicate in queue): ${truncateUrl(link.url)}`);
               continue;
             }
-            inFlightUrls.add(normalized);
+            inFlightUrls.add(lockKey);
           }
 
-          const channelName = channel.name || 'chat';
           let localArchiveCandidate = null;
-          if (normalized) {
-            const existing = await findDuplicateByUrl(link.url);
-            if (existing?.fileName) {
-              const rootDir = path.resolve(config.archiveDirectory);
-              const candidates = [
-                path.join(rootDir, existing.channel || '', existing.fileName),
-                path.join(rootDir, channelName, existing.fileName),
-                path.join(rootDir, existing.fileName),
-              ];
-              for (const cp of candidates) {
-                if (fs.existsSync(cp)) {
-                  localArchiveCandidate = cp;
-                  break;
-                }
-              }
-            }
+          if (normalized || platformMediaId) {
+            const existing = await findDuplicateByUrl(link.url, platformMediaId);
+            localArchiveCandidate = resolveArchivedFilePath(existing, archiveRoot, channelName);
           }
 
           if (localArchiveCandidate) {
@@ -499,32 +469,49 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
           tempDirsToCleanup.push(tempDir);
 
           try {
+            let dlResult = null;
             let filePaths = [];
             let subtitleFiles = [];
+            let isArchivedNsfw = false;
+
             if (localArchiveCandidate) {
               filePaths = [localArchiveCandidate];
+              const sidecar = await readArchivedSidecar(localArchiveCandidate);
+              isArchivedNsfw = Boolean(sidecar?.isNsfw);
             } else {
               try {
                 activeScanDownloads++;
-                const dlResult = await downloadMedia(link, tempDir, 2, scanAbortController?.signal);
+                const signal = scanAbortController?.signal;
+                dlResult = link.type === 'direct'
+                  ? [
+                      await downloadDirect(link.url, tempDir, config.hardCapBytes, {
+                        signal,
+                        filename: link.filename,
+                        allowLoopback: options.allowLoopback,
+                      }),
+                    ]
+                  : await downloadPlatformMedia(link.url, tempDir, 2, {
+                      signal,
+                      skipJitter: true,
+                      ytdlpRunner: options.ytdlpRunner,
+                      gallerydlRunner: options.gallerydlRunner,
+                    });
                 filePaths = Array.isArray(dlResult) ? dlResult : (dlResult?.mediaFiles || []);
                 subtitleFiles = Array.isArray(dlResult) ? [] : (dlResult?.subtitleFiles || []);
               } catch (dlErr) {
-                if (isAbortError(dlErr) || isScanStopRequested) {
+                if (isAbortError(dlErr) || isStopRequested()) {
                   throw dlErr;
                 }
                 // Fallback: check if media is already preserved in local archive
-                const existing = normalized ? await findDuplicateByUrl(link.url) : null;
-                if (existing?.fileName) {
-                  const candidateArchive = path.join(
-                    path.resolve(config.archiveDirectory),
-                    existing.channel || '',
-                    existing.fileName
-                  );
-                  if (fs.existsSync(candidateArchive)) {
-                    filePaths = [candidateArchive];
-                    console.log(`[Scanner] [W${workerId}] 📂 Reusing local archive copy for: ${truncateUrl(link.url)}`);
-                  }
+                const existing = (normalized || platformMediaId)
+                  ? await findDuplicateByUrl(link.url, platformMediaId)
+                  : null;
+                const fallbackArchive = resolveArchivedFilePath(existing, archiveRoot, channelName);
+                if (fallbackArchive) {
+                  filePaths = [fallbackArchive];
+                  const sidecar = await readArchivedSidecar(fallbackArchive);
+                  isArchivedNsfw = Boolean(sidecar?.isNsfw);
+                  console.log(`[Scanner] [W${workerId}] 📂 Reusing local archive copy for: ${truncateUrl(link.url)}`);
                 }
                 if (filePaths.length === 0) {
                   throw dlErr;
@@ -533,18 +520,45 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
                 activeScanDownloads = Math.max(0, activeScanDownloads - 1);
               }
             }
-            const authorTag = message.author?.tag || message.author?.username || 'Unknown';
-            const authorId = message.author?.id || '0';
-            const postedAt = message.createdTimestamp || Date.now();
+
+            const isDownloadedNsfw = Boolean(dlResult?.isNsfw || isArchivedNsfw);
+            const shouldSpoiler = shouldSpoilerMedia({
+              isDownloadedNsfw,
+              isKnownNsfw: Boolean(link.isKnownNsfw),
+              url: link.url,
+              isUserSpoiler: Boolean(link.isSpoiler),
+              isChannelNsfw: Boolean(channel?.nsfw),
+            });
 
             const postRecordsToSave = [];
+            let firstCleanTitle = '';
+            let addedLinkMediaCount = 0;
 
             for (const filePath of filePaths) {
               const parsed = path.parse(filePath);
               const cleanTitle = parsed.name;
+              if (!firstCleanTitle) firstCleanTitle = cleanTitle;
               const fileSize = (await fs.promises.stat(filePath)).size;
 
-              const fingerprint = await computeMediaFingerprint(filePath, link.url);
+              const fingerprint = await computeMediaFingerprint(filePath, link.url, {
+                signal: scanAbortController?.signal,
+              });
+              if (platformMediaId && !fingerprint.mediaId) {
+                fingerprint.mediaId = platformMediaId;
+              }
+
+              // Skip saving duplicate content if already archived (e.g., manual upload of previously posted media)
+              if (config.enableDuplicatePrevention && !options.force && !itemShouldUploadToDiscord) {
+                const { match } = await findDuplicate(fingerprint);
+                if (match) {
+                  stats.skippedCount++;
+                  speedTracker.recordItem();
+                  console.log(
+                    `[Scanner] [W${workerId}] ⏭️ Skipped duplicate media (already archived from #${match.channel}): ${cleanTitle}`
+                  );
+                  continue;
+                }
+              }
 
               // Dual-Format High-Quality GIF Pipeline
               let dualResult = { primaryFile: filePath, companionFiles: [], isGif: false };
@@ -567,6 +581,7 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
                 title: cleanTitle,
                 mediaId: fingerprint.mediaId,
                 sha256: fingerprint.sha256,
+                isNsfw: isDownloadedNsfw || Boolean(link.isKnownNsfw),
                 subtitleFiles,
                 companionFiles: config.archiveBothFormats ? dualResult.companionFiles : [],
               });
@@ -588,6 +603,9 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
                   `[Scanner] [W${workerId}] 💾 Saved: "${cleanTitle}${ext}" (${formatBytes(fileSize)}) | Speed: ${speedStr} (${itemsPerMin} dl/min)${etaStr}`
                 );
 
+                const archivedStat = await fs.promises.stat(archivedPath).catch(() => null);
+                const relativePath = path.relative(archiveRoot, archivedPath).split(path.sep).join('/');
+
                 // Queue entry into media index database
                 postRecordsToSave.push({
                   mediaId: fingerprint.mediaId,
@@ -600,43 +618,60 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
                   channel: channelName,
                   archivedAt: new Date().toISOString(),
                   fileName: path.basename(archivedPath),
+                  relativePath,
+                  fileSize: archivedStat ? archivedStat.size : fileSize,
                 });
 
-                // Save to SQLite link database (only for backup-eligible channels)
-                if (normalized && isLinkBackupChannel(channel)) {
-                  saveLinkRecord({
-                    normalizedUrl: normalized,
-                    originalUrl: link.url,
-                    guildId: channel.guildId || null,
-                    channelId: channel.id,
-                    channelName,
-                    messageId: message.id,
-                    authorId,
-                    authorTag,
-                    postedAt,
-                    content: message.content || null,
-                  });
-                }
-
                 // Prepare Discord attachment if upload is needed (use permanent archived file if present)
-                if (shouldUploadToDiscord) {
+                if (itemShouldUploadToDiscord) {
                   const sourceForUpload = dualResult.primaryFile || (fs.existsSync(filePath) ? filePath : archivedPath);
                   const isTargetGif = dualResult.isGif || path.extname(sourceForUpload).toLowerCase() === '.gif';
-                  let uploadCandidate = sourceForUpload;
-                  if (!isTargetGif && isVideoFile(sourceForUpload)) {
-                    uploadCandidate = await applyThumbnailPreview(sourceForUpload, tempDir, null, { signal: scanAbortController?.signal });
+                  const uploadStat = await fs.promises.stat(sourceForUpload).catch(() => null);
+                  const needsCompression =
+                    config.enableCompression &&
+                    !isTargetGif &&
+                    isVideo(sourceForUpload) &&
+                    (uploadStat?.size || 0) > config.maxFileSizeBytes;
+
+                  let discoveredThumb = null;
+                  if (config.prependThumbnailPreview && !isTargetGif && isVideo(sourceForUpload)) {
+                    discoveredThumb = await findThumbnailFile(sourceForUpload, tempDir);
                   }
-                  const finalPath = await ensureWithinLimit(uploadCandidate, null, null, { signal: scanAbortController?.signal });
+
+                  const preProbed = sourceForUpload === filePath ? fingerprint.mediaInfo : undefined;
+                  let uploadCandidate = sourceForUpload;
+                  if (!needsCompression && !isTargetGif && isVideo(sourceForUpload)) {
+                    uploadCandidate = await applyThumbnailPreview(sourceForUpload, tempDir, discoveredThumb, {
+                      signal: scanAbortController?.signal,
+                      mediaInfo: preProbed,
+                    });
+                  }
+                  const finalPath = await ensureWithinLimit(
+                    uploadCandidate,
+                    null,
+                    needsCompression ? discoveredThumb : null,
+                    {
+                      signal: scanAbortController?.signal,
+                      mediaInfo: uploadCandidate === filePath ? preProbed : undefined,
+                    }
+                  );
                   if (finalPath) {
                     const finalExt = path.extname(finalPath);
                     const attachmentName = `${cleanTitle}${finalExt}`;
+                    const mediaBuilder = new AttachmentBuilder(finalPath, { name: attachmentName });
+                    if (shouldSpoiler) {
+                      mediaBuilder.setSpoiler(true);
+                    }
                     messageAttachmentsToUpload.push({
-                      builder: new AttachmentBuilder(finalPath, { name: attachmentName }),
+                      builder: mediaBuilder,
                       tempFilePath: (finalPath !== archivedPath && finalPath !== filePath) ? finalPath : null,
                       title: cleanTitle,
-                      isVideo: isVideoFile(finalPath),
-                      isAudio: isAudioFile(finalPath),
+                      isVideo: isVideo(finalPath),
+                      isAudio: isAudio(finalPath),
+                      isSubtitle: false,
+                      isSpoiler: shouldSpoiler,
                     });
+                    addedLinkMediaCount++;
                   }
                 }
 
@@ -648,12 +683,31 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
               }
             }
 
-            // Save all records from this post together
-            for (const record of postRecordsToSave) {
-              await saveRecord(record);
+            if (itemShouldUploadToDiscord && addedLinkMediaCount > 0 && config.uploadSubtitlesToDiscord && subtitleFiles.length > 0) {
+              const subAttachments = await prepareSubtitleAttachments(
+                subtitleFiles,
+                firstCleanTitle,
+                tempDir,
+                shouldSpoiler,
+                scanAbortController?.signal
+              );
+              for (const subBuilder of subAttachments) {
+                messageAttachmentsToUpload.push({
+                  builder: subBuilder,
+                  tempFilePath: null,
+                  title: `${firstCleanTitle} (CC)`,
+                  isVideo: false,
+                  isAudio: false,
+                  isSubtitle: true,
+                  isSpoiler: shouldSpoiler,
+                });
+              }
             }
+
+            // Save all records from this post together in a single SQLite transaction
+            await saveRecordBatch(postRecordsToSave);
           } catch (downloadErr) {
-            if (isAbortError(downloadErr) || isScanStopRequested) {
+            if (isAbortError(downloadErr) || isStopRequested()) {
               console.log(`[Scanner] [W${workerId}] 🛑 Download aborted by user: ${truncateUrl(link.url)}`);
               break;
             }
@@ -661,8 +715,8 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
             speedTracker.recordItem();
             console.warn(`[Scanner] [W${workerId}] ⚠️ Failed: ${truncateUrl(link.url)} (${downloadErr.message})`);
           } finally {
-            if (normalized) {
-              inFlightUrls.delete(normalized);
+            if (lockKey) {
+              inFlightUrls.delete(lockKey);
             }
           }
 
@@ -687,34 +741,20 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
                   allowedMentions: { repliedUser: false },
                 };
 
-                if (config.includeTitleInMessage) {
-                  const validItems = chunkItems.filter((item) => isValidDisplayTitle(item.title));
-                  const uniqueTitles = [...new Set(validItems.map((item) => item.title.replace(/[\r\n]+/g, ' ').trim()))];
-
-                  if (totalBatches > 1) {
-                    const albumTitle = uniqueTitles.length === 1 ? ` — **${uniqueTitles[0]}**` : '';
-                    replyOptions.content = `🖼️ Album Part ${batchNum}/${totalBatches} (${chunk.length} items)${albumTitle}:`;
-                  } else if (uniqueTitles.length === 1) {
-                    const singleItem = validItems[0] || chunkItems[0];
-                    const icon = singleItem.isVideo ? '🎬' : singleItem.isAudio ? '🎵' : '🖼️';
-                    replyOptions.content = `${icon} **${uniqueTitles[0]}**`;
-                  } else if (uniqueTitles.length > 1) {
-                    const titleLines = validItems.slice(0, 5).map((item) => {
-                      const icon = item.isVideo ? '🎬' : item.isAudio ? '🎵' : '🖼️';
-                      const t = item.title.replace(/[\r\n]+/g, ' ').trim();
-                      return `${icon} **${t}**`;
-                    });
-                    replyOptions.content = [...new Set(titleLines)].join('\n');
-                  }
-                } else if (totalBatches > 1) {
-                  replyOptions.content = `🖼️ Album Part ${batchNum}/${totalBatches} (${chunk.length} items):`;
+                const content = formatMediaMessageContent(chunkItems, { batchNum, totalBatches });
+                if (content) {
+                  replyOptions.content = content;
                 }
 
-                await message.reply(replyOptions);
+                await safeReply(message, replyOptions);
               }
 
               if (config.autoSuppressEmbeds) {
-                await message.suppressEmbeds(true).catch(() => {});
+                try {
+                  await message.suppressEmbeds(true);
+                } catch {
+                  setTimeout(() => message.suppressEmbeds(true).catch(() => {}), 1500).unref?.();
+                }
               }
 
               stats.repostedMissingCount++;
@@ -743,19 +783,16 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
           await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
         }
       }
-    } // end while(true)
+    } // end while(workQueue.length > 0)
   }; // end workerLoop
 
-  // Spawn Workers
-  const workers = Array.from({ length: concurrency }).map((_, i) => workerLoop(i + 1));
-
-  // Producer Loop: Fetch messages and enqueue them
+  // Producer Loop: Fetch messages first so they can be sorted oldest-to-newest without worker spin-waiting
   let lastMessageId = null;
   let remainingLimit = options.limit || Infinity;
 
   try {
     while (remainingLimit > 0) {
-      if (isScanStopRequested) {
+      if (isStopRequested()) {
         console.log('[Scanner] 🛑 Stop requested. Producer exiting...');
         break;
       }
@@ -794,8 +831,15 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
           repliedWithAttachmentMessageIds.add(msg.reference.messageId);
         }
 
-        // Collect candidate messages that actually contain links
-        if (!msg.author.bot && msg.content && msg.content.includes('http')) {
+        // Collect candidate messages that actually contain links or manual user media uploads
+        const hasHttpLink = Boolean(msg.content && msg.content.includes('http'));
+        const hasUserAttachments = Boolean(
+          config.enableLocalArchive &&
+          config.archiveUserAttachments &&
+          isChannelAllowed(channel.id) &&
+          extractMessageAttachments(msg).length > 0
+        );
+        if (!msg.author.bot && (hasHttpLink || hasUserAttachments)) {
           candidateMessages.push(msg);
         }
       }
@@ -825,8 +869,11 @@ export async function crawlChannel(channel, options = {}, onProgress = null) {
   }
 
   try {
-    // Wait for all workers to finish processing the queue
-    await Promise.all(workers);
+    if (workQueue.length > 0 && !isStopRequested()) {
+      const workerCount = Math.min(concurrency, workQueue.length);
+      const workers = Array.from({ length: workerCount }).map((_, i) => workerLoop(i + 1));
+      await Promise.all(workers);
+    }
   } finally {
     scanAbortController = null;
   }
@@ -877,7 +924,7 @@ export async function handleRescanCommand(commandMessage) {
   }
 
   // Permission Check: Requires Manage Messages or Administrator permissions (or server owner)
-  if (commandMessage.member && !commandMessage.member.permissions.has(PermissionFlagsBits.ManageMessages) && !commandMessage.member.permissions.has(PermissionFlagsBits.Administrator)) {
+  if (!isModeratorOrOwner(commandMessage.member, commandMessage.guild, commandMessage.author?.id)) {
     const notice = await commandMessage.reply({
       content: '❌ You need the `Manage Messages` or `Administrator` permission to run a channel rescan.',
       allowedMentions: { repliedUser: false },
@@ -899,15 +946,9 @@ export async function handleRescanCommand(commandMessage) {
         c &&
         (c.type === ChannelType.GuildText || c.type === ChannelType.GuildAnnouncement) &&
         c.viewable &&
-        c.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.ReadMessageHistory)
+        c.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.ReadMessageHistory) &&
+        (isChannelAllowed(c.id) || isLinkBackupChannel(c))
     );
-
-    // Apply allowed/disallowed channel filtering while ensuring link backup channels are preserved
-    if (config.allowedChannelIds.length > 0) {
-      targetChannels = targetChannels.filter((c) => config.allowedChannelIds.includes(c.id) || isLinkBackupChannel(c));
-    } else if (config.disallowedChannelIds.length > 0) {
-      targetChannels = targetChannels.filter((c) => !config.disallowedChannelIds.includes(c.id) || isLinkBackupChannel(c));
-    }
   } else if (target === 'current') {
     if (!isChannelAllowed(commandMessage.channel.id) && !isLinkBackupChannel(commandMessage.channel)) {
       const notice = await commandMessage.reply({
@@ -994,7 +1035,7 @@ export async function handleRescanCommand(commandMessage) {
 
   try {
     for (let i = 0; i < targetChannels.length; i++) {
-      if (isScanStopRequested) {
+      if (isStopRequested()) {
         console.log('[Scanner] 🛑 Rescan stopped early by user request.');
         break;
       }
@@ -1045,7 +1086,7 @@ export async function handleRescanCommand(commandMessage) {
 
     const totalElapsed = formatDuration(Date.now() - startTime);
     const finalSize = formatBytes(aggregate.totalBytes);
-    const wasStopped = isScanStopRequested;
+    const wasStopped = isStopRequested();
 
     let finalSummary = wasStopped
       ? `🛑 **${modeName} Stopped Early by User!**\n`
@@ -1079,20 +1120,48 @@ export async function handleRescanCommand(commandMessage) {
       .catch(() => {});
   } finally {
     isScanningActive = false;
-    isScanStopRequested = false;
+    clearStopRequested();
   }
 }
 
 /**
  * Resolves all text and announcement channels across all guilds that the bot can view and read history for,
- * strictly filtered by whitelist (ALLOWED_CHANNEL_IDS) or blacklist (DISALLOWED_CHANNEL_IDS).
+ * strictly filtered by whitelist (`ALLOWED_CHANNEL_IDS`) or blacklist (`DISALLOWED_CHANNEL_IDS`) while
+ * always preserving `LINK_BACKUP_CHANNELS` so link backups are never dropped during startup catch-up scans.
  */
 export async function getScannableChannels(client) {
   const targetChannels = new Map();
 
-  // If whitelist is set, strictly resolve only those channels
-  if (config.allowedChannelIds.length > 0) {
+  // 1. Discover eligible media & link-backup channels across all active guilds
+  if (client.guilds?.cache) {
+    for (const guild of client.guilds.cache.values()) {
+      try {
+        const me =
+          guild.members?.me ||
+          (guild.members?.fetchMe ? await guild.members.fetchMe().catch(() => null) : null);
+        const channels = await guild.channels.fetch().catch(() => null);
+        if (!channels) continue;
+        for (const ch of channels.values()) {
+          if (
+            ch &&
+            (ch.type === ChannelType.GuildText || ch.type === ChannelType.GuildAnnouncement) &&
+            ch.viewable &&
+            (!me || ch.permissionsFor(me)?.has(PermissionFlagsBits.ReadMessageHistory)) &&
+            (isChannelAllowed(ch.id) || isLinkBackupChannel(ch))
+          ) {
+            targetChannels.set(ch.id, ch);
+          }
+        }
+      } catch (err) {
+        console.warn(`[Scanner] Could not fetch channels for guild ${guild.name} (${guild.id}):`, err.message);
+      }
+    }
+  }
+
+  // 2. Also fetch any explicit channel IDs in ALLOWED_CHANNEL_IDS not yet in targetChannels
+  if (config.allowedChannelIds.length > 0 && client.channels?.fetch) {
     for (const channelId of config.allowedChannelIds) {
+      if (targetChannels.has(channelId)) continue;
       try {
         const ch = await client.channels.fetch(channelId).catch(() => null);
         if (
@@ -1112,31 +1181,6 @@ export async function getScannableChannels(client) {
         console.warn(`[Scanner] Could not access allowed channel ${channelId}:`, err.message);
       }
     }
-    return Array.from(targetChannels.values());
-  }
-
-  // Otherwise, discover scannable channels across all active guilds (excluding blacklist)
-  for (const guild of client.guilds.cache.values()) {
-    try {
-      const me =
-        guild.members?.me ||
-        (guild.members?.fetchMe ? await guild.members.fetchMe().catch(() => null) : null);
-      const channels = await guild.channels.fetch().catch(() => null);
-      if (!channels) continue;
-      for (const ch of channels.values()) {
-        if (
-          ch &&
-          (ch.type === ChannelType.GuildText || ch.type === ChannelType.GuildAnnouncement) &&
-          ch.viewable &&
-          (!me || ch.permissionsFor(me)?.has(PermissionFlagsBits.ReadMessageHistory)) &&
-          isChannelAllowed(ch.id)
-        ) {
-          targetChannels.set(ch.id, ch);
-        }
-      }
-    } catch (err) {
-      console.warn(`[Scanner] Could not fetch channels for guild ${guild.name} (${guild.id}):`, err.message);
-    }
   }
 
   return Array.from(targetChannels.values());
@@ -1144,7 +1188,7 @@ export async function getScannableChannels(client) {
 
 /**
  * Automatically scans recent message history (default: last 24 hours) across all
- * whitelisted / non-blacklisted channels on bot startup. Downloads media and backfills
+ * whitelisted / non-blacklisted / backup channels on bot startup. Downloads media and backfills
  * any missed uploads to Discord.
  */
 export async function runStartupScan(client) {
@@ -1154,7 +1198,7 @@ export async function runStartupScan(client) {
   }
 
   isScanningActive = true;
-  isScanStopRequested = false;
+  clearStopRequested();
 
   const hours = config.autoScanHours || 24;
   const sinceTimestamp = Date.now() - hours * 60 * 60 * 1000;
@@ -1189,6 +1233,7 @@ export async function runStartupScan(client) {
       channelsCount: targetChannels.length,
       messagesScanned: 0,
       mediaLinksFound: 0,
+      linksBackedUp: 0,
       archivedCount: 0,
       repostedMissingCount: 0,
       skippedCount: 0,
@@ -1197,7 +1242,7 @@ export async function runStartupScan(client) {
     };
 
     for (let i = 0; i < targetChannels.length; i++) {
-      if (isScanStopRequested) {
+      if (isStopRequested()) {
         console.log('[Startup Scan] 🛑 Startup scan aborted by user request.');
         break;
       }
@@ -1213,6 +1258,7 @@ export async function runStartupScan(client) {
 
       aggregate.messagesScanned += chStats.messagesScanned;
       aggregate.mediaLinksFound += chStats.mediaLinksFound;
+      aggregate.linksBackedUp += (chStats.linksBackedUp || 0);
       aggregate.archivedCount += chStats.archivedCount;
       aggregate.repostedMissingCount += chStats.repostedMissingCount;
       aggregate.skippedCount += chStats.skippedCount;
@@ -1229,6 +1275,7 @@ export async function runStartupScan(client) {
       `\n[Startup Scan] • Channels scanned: ${aggregate.channelsCount}` +
       `\n[Startup Scan] • Messages scanned: ${aggregate.messagesScanned.toLocaleString()}` +
       `\n[Startup Scan] • Media links found: ${aggregate.mediaLinksFound.toLocaleString()}` +
+      (aggregate.linksBackedUp > 0 ? `\n[Startup Scan] • Links backed up: ${aggregate.linksBackedUp.toLocaleString()}` : '') +
       `\n[Startup Scan] • Files archived to PC: ${aggregate.archivedCount} (${finalSize})` +
       (repostMissing ? `\n[Startup Scan] • Reposted missing to Discord: ${aggregate.repostedMissingCount}` : '') +
       `\n[Startup Scan] • Already archived (skipped): ${aggregate.skippedCount}` +
@@ -1239,6 +1286,6 @@ export async function runStartupScan(client) {
     console.error('[Startup Scan] ❌ Error during startup catch-up scan:', err);
   } finally {
     isScanningActive = false;
-    isScanStopRequested = false;
+    clearStopRequested();
   }
 }

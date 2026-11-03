@@ -1,19 +1,25 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { config } from './config.js';
 import { getGalleryDlConfigPath } from './galleryDlConfig.js';
 import { getCookieForUrl } from './cookieVault.js';
-import { killProcessTree, getBrowserUserAgent, registerDownloadProcess, unregisterDownloadProcess } from './utils.js';
+import {
+  getBrowserUserAgent,
+  runProcess,
+  PYTHON_BIN,
+  isPartialTempFile,
+  isCookieLockError,
+  purgeTempDownloadArtifacts,
+  isAbortError,
+} from './utils.js';
 import { checkNsfwInMetadata } from './urlExtractor.js';
 
 const TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes (allows buffer for platform rate-limit waits)
 
 /**
  * Uses gallery-dl to download image(s) from a platform link (Twitter/X,
- * Instagram, Reddit, Tumblr, Pixiv, etc). gallery-dl is built for image
- * galleries, unlike yt-dlp which targets video. Returns an array of
- * downloaded file paths with isNsfw property.
+ * Instagram, Reddit, Tumblr, Pixiv, etc). Returns an array of downloaded
+ * file paths with `mediaFiles` and `isNsfw` properties attached.
  */
 export async function downloadWithGalleryDl(url, destDir, options = {}) {
   if (options?.signal?.aborted) {
@@ -25,40 +31,65 @@ export async function downloadWithGalleryDl(url, destDir, options = {}) {
   const hardCapMB = Math.max(1, Math.floor(config.hardCapBytes / (1024 * 1024)));
 
   const activeBrowser = config.cookiesFromBrowser || 'chrome';
-  const args = [
-    '-d', destDir,
-    '--no-mtime',
-    '--no-check-certificate',
-    '--filesize-max', `${hardCapMB}M`,
-    '--user-agent', getBrowserUserAgent(activeBrowser),
-    '--write-metadata',
-  ];
-
-  const cookiePath = getCookieForUrl(url);
-  if (config.cookiesFromBrowser && (config.preferBrowserCookies || !cookiePath || !fs.existsSync(cookiePath))) {
-    args.push('--cookies-from-browser', config.cookiesFromBrowser);
-  } else if (cookiePath && fs.existsSync(cookiePath)) {
-    args.push('--cookies', cookiePath);
-  } else if (config.cookiesFromBrowser) {
-    args.push('--cookies-from-browser', config.cookiesFromBrowser);
-  }
-
   const gdlConfigPath = await getGalleryDlConfigPath();
-  if (gdlConfigPath) {
-    args.push('-c', gdlConfigPath);
-  }
 
-  args.push(url);
+  const buildArgs = (disableBrowserCookies = false) => {
+    const args = [
+      '-d', destDir,
+      '--no-mtime',
+      '--no-check-certificate',
+      '--filesize-max', `${hardCapMB}M`,
+      '--user-agent', getBrowserUserAgent(activeBrowser),
+      '--write-metadata',
+    ];
 
-  if (config.usePythonGalleryDl) {
-    await runProcess('python3', ['-m', 'gallery_dl', ...args], options?.signal);
-  } else {
-    await runProcess(config.gallerydlPath, args, options?.signal);
+    const cookiePath = getCookieForUrl(url);
+    const allowBrowser = Boolean(config.cookiesFromBrowser && !disableBrowserCookies);
+    if (allowBrowser && (config.preferBrowserCookies || !cookiePath || !fs.existsSync(cookiePath))) {
+      args.push('--cookies-from-browser', config.cookiesFromBrowser);
+    } else if (cookiePath && fs.existsSync(cookiePath)) {
+      args.push('--cookies', cookiePath);
+    }
+
+    if (gdlConfigPath) {
+      args.push('-c', gdlConfigPath);
+    }
+    args.push(url);
+    return args;
+  };
+
+  const executeGalleryDl = async (disableBrowserCookies = false) => {
+    const args = buildArgs(disableBrowserCookies);
+    if (config.usePythonGalleryDl) {
+      return runProcess(PYTHON_BIN, ['-m', 'gallery_dl', ...args], {
+        timeoutMs: TIMEOUT_MS,
+        signal: options?.signal,
+      });
+    }
+    return runProcess(config.gallerydlPath, args, {
+      timeoutMs: TIMEOUT_MS,
+      signal: options?.signal,
+    });
+  };
+
+  try {
+    await executeGalleryDl(false);
+  } catch (err) {
+    if (options?.signal?.aborted || isAbortError(err)) throw err;
+    if (config.cookiesFromBrowser && isCookieLockError(err)) {
+      console.warn('[gallery-dl] Browser cookie database locked; retrying without browser cookies...');
+      await purgeTempDownloadArtifacts(destDir);
+      await executeGalleryDl(true);
+    } else {
+      throw err;
+    }
   }
 
   const allFiles = await walkFiles(destDir);
   const jsonFiles = allFiles.filter((f) => f.endsWith('.json'));
-  const mediaFiles = allFiles.filter((f) => !f.endsWith('.json') && !f.endsWith('.txt'));
+  const mediaFiles = allFiles.filter(
+    (f) => !f.endsWith('.json') && !f.endsWith('.txt') && !isPartialTempFile(f)
+  );
 
   if (mediaFiles.length === 0) {
     throw new Error('GALLERYDL_NO_MEDIA_FOUND');
@@ -79,8 +110,6 @@ export async function downloadWithGalleryDl(url, destDir, options = {}) {
   return Object.assign(mediaFiles, { mediaFiles, isNsfw });
 }
 
-// gallery-dl nests downloads in site/user subdirectories by default, so we
-// walk the whole tree rather than assuming a flat structure.
 async function walkFiles(dir) {
   const entries = await fs.promises.readdir(dir, { withFileTypes: true });
   const results = [];
@@ -93,61 +122,4 @@ async function walkFiles(dir) {
     }
   }
   return results;
-}
-
-function runProcess(cmd, args, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      return reject(new Error('DOWNLOAD_ABORTED'));
-    }
-
-    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    registerDownloadProcess(child);
-    let stderr = '';
-
-    const timer = setTimeout(() => {
-      unregisterDownloadProcess(child);
-      killProcessTree(child);
-      reject(new Error(`TIMEOUT: ${cmd} took too long`));
-    }, TIMEOUT_MS);
-
-    const onAbort = () => {
-      clearTimeout(timer);
-      unregisterDownloadProcess(child);
-      killProcessTree(child);
-      reject(new Error('DOWNLOAD_ABORTED'));
-    };
-
-    if (signal) {
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
-
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      unregisterDownloadProcess(child);
-      if (signal) signal.removeEventListener('abort', onAbort);
-      if (err.code === 'ENOENT') {
-        reject(new Error(`COMMAND_NOT_FOUND: ${cmd} is not installed or not on PATH`));
-      } else {
-        reject(err);
-      }
-    });
-
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      unregisterDownloadProcess(child);
-      if (signal) signal.removeEventListener('abort', onAbort);
-      if (signal?.aborted) {
-        reject(new Error('DOWNLOAD_ABORTED'));
-      } else if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(`${cmd} exited with code ${code}: ${stderr.trim()}`));
-      }
-    });
-  });
 }

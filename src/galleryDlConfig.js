@@ -5,21 +5,24 @@ import { config } from './config.js';
 import { getCookieForUrl } from './cookieVault.js';
 
 let cachedConfigPath = null;
+let cachedConfigSerialized = null;
 
 /**
- * Reddit has started flagging gallery-dl's default scraping-style requests
- * as bot traffic ("You've been blocked by network security"). The
- * documented fix is to have gallery-dl authenticate against Reddit's real
- * API instead — see https://gdl-org.github.io/docs/configuration.html#extractor-reddit-client-id-user-agent
- *
- * If REDDIT_CLIENT_ID + REDDIT_USER_AGENT are set, this builds a small
- * gallery-dl config file once and returns its path so it can be passed via
- * `-c`. Returns null if no Reddit credentials are configured, in which case
- * gallery-dl falls back to its unauthenticated default behavior.
+ * Resets the cached gallery-dl JSON configuration path (useful in tests or
+ * when runtime cookie/credential configuration changes).
+ */
+export function resetGalleryDlConfigCache() {
+  cachedConfigPath = null;
+  cachedConfigSerialized = null;
+}
+
+/**
+ * Builds and caches a temporary `gallery-dl` JSON config file for extractor
+ * options (Reddit OAuth, Pixiv refresh token, Instagram cookies/credentials).
+ * When `cookiesFromBrowser` and `preferBrowserCookies` are active, static
+ * `instagram.cookies` is omitted so CLI `--cookies-from-browser` takes precedence.
  */
 export async function getGalleryDlConfigPath() {
-  if (cachedConfigPath) return cachedConfigPath;
-
   const gdlConfig = {
     extractor: {
       twitter: {
@@ -31,7 +34,6 @@ export async function getGalleryDlConfigPath() {
       },
     },
   };
-  let hasConfig = true;
 
   if (config.redditClientId && config.redditUserAgent) {
     const redditConfig = {
@@ -51,9 +53,12 @@ export async function getGalleryDlConfigPath() {
   }
 
   const instagramConfig = { videos: true };
-  const igCookies = getCookieForUrl('https://www.instagram.com');
-  if (igCookies) {
-    instagramConfig['cookies'] = igCookies;
+  const preferBrowser = Boolean(config.cookiesFromBrowser && config.preferBrowserCookies);
+  if (!preferBrowser) {
+    const igCookies = getCookieForUrl('https://www.instagram.com');
+    if (igCookies) {
+      instagramConfig['cookies'] = igCookies;
+    }
   }
   if (config.instagramUsername && config.instagramPassword) {
     instagramConfig['username'] = config.instagramUsername;
@@ -62,9 +67,14 @@ export async function getGalleryDlConfigPath() {
 
   gdlConfig.extractor.instagram = instagramConfig;
 
+  const serialized = JSON.stringify(gdlConfig, null, 2);
+  if (cachedConfigPath && cachedConfigSerialized === serialized && fs.existsSync(cachedConfigPath)) {
+    return cachedConfigPath;
+  }
+
   const configPath = path.join(os.tmpdir(), 'archivist-fox-gallerydl-config.json');
-  await fs.promises.writeFile(configPath, JSON.stringify(gdlConfig, null, 2));
+  await fs.promises.writeFile(configPath, serialized, 'utf8');
   cachedConfigPath = configPath;
+  cachedConfigSerialized = serialized;
   return configPath;
 }
-

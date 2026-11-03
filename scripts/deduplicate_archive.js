@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { config } from '../src/config.js';
+import { initLinkDb, closeLinkDb, backupDatabaseSafely } from '../src/linkDb.js';
 
 const args = process.argv.slice(2);
 const isDryRun = args.includes('--dry-run') || args.includes('-d');
@@ -37,13 +37,6 @@ console.log(`Mode: ${isDryRun ? 'DRY RUN (no files will be deleted)' : 'LIVE (re
 console.log(`Targets: ${targetDirs.length} directory(ies)`);
 console.log('--------------------------------------------------------');
 
-// Backup SQLite database before modifying
-if (!isDryRun && fs.existsSync(dbPath)) {
-  const backupPath = `${dbPath}.bak-${Date.now()}`;
-  fs.copyFileSync(dbPath, backupPath);
-  console.log(`[Backup] Backed up database to ${backupPath}`);
-}
-
 let grandPreserved = 0;
 let grandDeletedMedia = 0;
 let grandDeletedJson = 0;
@@ -53,9 +46,16 @@ let db = null;
 let updateStmt = null;
 if (!isDryRun && fs.existsSync(dbPath)) {
   try {
-    db = new DatabaseSync(dbPath);
-    updateStmt = db.prepare('UPDATE media_records SET file_name = ? WHERE channel = ? AND (media_id = ? OR original_url = ?)');
-  } catch {}
+    db = initLinkDb(dbPath);
+    const backupPath = `${dbPath}.bak-${Date.now()}`;
+    backupDatabaseSafely(db, backupPath);
+    console.log(`[Backup] Backed up database to ${backupPath}`);
+    updateStmt = db.prepare(
+      'UPDATE media_records SET file_name = ?, relative_path = ? WHERE channel = ? AND (media_id = ? OR original_url = ?)'
+    );
+  } catch (err) {
+    console.warn('[DB] Warning: could not initialize database for deduplication:', err.message);
+  }
 }
 
 for (const targetDir of targetDirs) {
@@ -156,7 +156,8 @@ for (const targetDir of targetDirs) {
 
     if (!isDryRun && updateStmt) {
       try {
-        updateStmt.run(canonical.mediaName, dirName, key, key);
+        const relPath = path.relative(archiveRoot, canonical.mediaPath).split(path.sep).join('/');
+        updateStmt.run(canonical.mediaName, relPath, dirName, key, key);
       } catch {}
     }
   }
@@ -196,3 +197,7 @@ console.log(`Duplicate media files removed: ${grandDeletedMedia}`);
 console.log(`Duplicate JSON sidecars removed: ${grandDeletedJson}`);
 console.log(`Total storage reclaimed: ${(grandReclaimedBytes / 1024 / 1024 / 1024).toFixed(2)} GB (${grandReclaimedBytes.toLocaleString()} bytes)`);
 console.log('========================================================');
+
+if (db) {
+  closeLinkDb();
+}

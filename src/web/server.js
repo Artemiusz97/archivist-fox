@@ -1,6 +1,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { config } from '../config.js';
@@ -8,56 +9,133 @@ import { initLinkDb, getDb } from '../linkDb.js';
 import { ensureBinaries } from '../ensureBinaries.js';
 import { downloadMediaItem } from '../downloaderCore.js';
 
-// Cache for fast file resolution: filename -> fullPath
+const MAX_FILE_CACHE = 500;
+const MAX_TASKS = 200;
+
+// Cache for fast file resolution: `${archiveRoot}::${basename}` -> fullPath
 const fileLocationCache = new Map();
 
+function isTestMode() {
+  return (
+    process.env.NODE_ENV === 'test' ||
+    process.execArgv.includes('--test') ||
+    Boolean(process.env.NODE_TEST_CONTEXT)
+  );
+}
+
+function isLoopbackAddress(remoteAddress = '') {
+  const addr = String(remoteAddress).trim().toLowerCase();
+  return (
+    addr === '127.0.0.1' ||
+    addr === '::1' ||
+    addr === '::ffff:127.0.0.1' ||
+    addr.startsWith('::ffff:127.')
+  );
+}
+
+/**
+ * Verifies via `fs.promises.realpath` that `candidatePath` exists and resides
+ * strictly inside `archiveRoot` (blocking `..`, `.env`, symlinks, and sibling-prefix escapes).
+ *
+ * @param {string} candidatePath
+ * @param {string} archiveRoot
+ * @param {{ allowRootDir?: boolean }} [opts={}]
+ * @returns {Promise<string|null>}
+ */
+async function verifyContainedRealPath(candidatePath, archiveRoot, { allowRootDir = false } = {}) {
+  if (!candidatePath || !archiveRoot) return null;
+  try {
+    const realArchive = await fs.promises.realpath(archiveRoot);
+    const realCandidate = await fs.promises.realpath(candidatePath);
+    const rel = path.relative(realArchive, realCandidate);
+    if (rel === '') {
+      return allowRootDir ? realCandidate : null;
+    }
+    if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
+      return realCandidate;
+    }
+  } catch {}
+  return null;
+}
+
+function cacheArchiveLocation(cacheKey, resolvedPath) {
+  fileLocationCache.set(cacheKey, resolvedPath);
+  if (fileLocationCache.size > MAX_FILE_CACHE) {
+    const oldestKey = fileLocationCache.keys().next().value;
+    fileLocationCache.delete(oldestKey);
+  }
+}
+
 async function findArchivedFile(targetFile) {
-  if (!targetFile) return null;
-  const basename = path.basename(targetFile);
-
-  // Check cache first
-  if (fileLocationCache.has(basename)) {
-    const cached = fileLocationCache.get(basename);
-    if (fs.existsSync(cached)) return cached;
-    fileLocationCache.delete(basename);
-  }
-
+  if (!targetFile || typeof targetFile !== 'string') return null;
   const archiveRoot = path.resolve(config.archiveDirectory);
+  if (!fs.existsSync(archiveRoot)) return null;
 
-  // 1. Direct path check
-  const directPath = path.isAbsolute(targetFile) ? path.resolve(targetFile) : path.resolve(archiveRoot, targetFile);
-  if (fs.existsSync(directPath) && fs.statSync(directPath).isFile()) {
-    fileLocationCache.set(basename, directPath);
-    return directPath;
+  const rawCandidate = path.isAbsolute(targetFile)
+    ? path.resolve(targetFile)
+    : path.resolve(archiveRoot, targetFile);
+
+  // Reject any path whose lexical resolution already escapes archiveRoot before touching disk/DB
+  const realArchiveRoot = await fs.promises.realpath(archiveRoot).catch(() => null);
+  if (!realArchiveRoot) return null;
+
+  const lexicalRel = path.relative(archiveRoot, rawCandidate);
+  if (lexicalRel.startsWith('..') || path.isAbsolute(lexicalRel)) {
+    return null;
   }
 
-  // 2. Query database for channel subfolder (e.g. archiveRoot/channel/filename)
+  // 1. Direct path check inside archiveRoot
+  const directContained = await verifyContainedRealPath(rawCandidate, realArchiveRoot);
+  if (directContained) {
+    const st = await fs.promises.stat(directContained).catch(() => null);
+    if (st?.isFile()) {
+      return directContained;
+    }
+  }
+
+  const basename = path.basename(targetFile);
+  if (!basename || basename === '.' || basename === '..') return null;
+
+  const cacheKey = `${realArchiveRoot}::${basename}`;
+  if (fileLocationCache.has(cacheKey)) {
+    const cached = await verifyContainedRealPath(fileLocationCache.get(cacheKey), realArchiveRoot);
+    if (cached) return cached;
+    fileLocationCache.delete(cacheKey);
+  }
+
+  // 2. O(1) SQLite lookup via relative_path or channel/date folder
   try {
     const db = getDb();
-    const row = db.prepare('SELECT channel, archived_at FROM media_records WHERE file_name = ? LIMIT 1').get(basename);
-    if (row && row.channel) {
-      const channelFolder = path.join(archiveRoot, row.channel, basename);
-      if (fs.existsSync(channelFolder)) {
-        fileLocationCache.set(basename, channelFolder);
-        return channelFolder;
+    const row = db
+      .prepare('SELECT relative_path, channel, archived_at FROM media_records WHERE file_name = ? LIMIT 1')
+      .get(basename);
+    if (row) {
+      const dbCandidates = [];
+      if (row.relative_path) {
+        dbCandidates.push(path.join(realArchiveRoot, row.relative_path));
       }
-      if (row.archived_at) {
-        const dateStr = row.archived_at.slice(0, 7);
-        const sub1 = path.join(archiveRoot, row.channel, dateStr, basename);
-        if (fs.existsSync(sub1)) {
-          fileLocationCache.set(basename, sub1);
-          return sub1;
+      if (row.channel) {
+        dbCandidates.push(path.join(realArchiveRoot, row.channel, basename));
+        if (row.archived_at) {
+          const dateStr = row.archived_at.slice(0, 7);
+          dbCandidates.push(path.join(realArchiveRoot, row.channel, dateStr, basename));
+          dbCandidates.push(path.join(realArchiveRoot, dateStr, row.channel, basename));
         }
-        const sub2 = path.join(archiveRoot, dateStr, row.channel, basename);
-        if (fs.existsSync(sub2)) {
-          fileLocationCache.set(basename, sub2);
-          return sub2;
+      }
+      for (const cand of dbCandidates) {
+        const contained = await verifyContainedRealPath(cand, realArchiveRoot);
+        if (contained) {
+          const st = await fs.promises.stat(contained).catch(() => null);
+          if (st?.isFile()) {
+            cacheArchiveLocation(cacheKey, contained);
+            return contained;
+          }
         }
       }
     }
   } catch {}
 
-  // 3. Recursive search in archiveRoot
+  // 3. Fallback recursive search inside realArchiveRoot
   async function searchDir(dir) {
     try {
       const entries = await fs.promises.readdir(dir, { withFileTypes: true });
@@ -67,47 +145,62 @@ async function findArchivedFile(targetFile) {
           const found = await searchDir(full);
           if (found) return found;
         } else if (entry.isFile() && entry.name === basename) {
-          return full;
+          return await verifyContainedRealPath(full, realArchiveRoot);
         }
       }
     } catch {}
     return null;
   }
 
-  const found = await searchDir(archiveRoot);
+  const found = await searchDir(realArchiveRoot);
   if (found) {
-    fileLocationCache.set(basename, found);
+    cacheArchiveLocation(cacheKey, found);
   }
   return found;
 }
 
 async function openFolderOrFile(targetPath) {
   const archiveRoot = path.resolve(config.archiveDirectory);
-  let resolved = targetPath ? (await findArchivedFile(targetPath)) : archiveRoot;
+  let resolved = null;
 
-  if (!resolved || !fs.existsSync(resolved)) {
-    resolved = archiveRoot;
-    if (!fs.existsSync(resolved)) {
-      fs.mkdirSync(resolved, { recursive: true });
+  if (targetPath !== undefined && targetPath !== null && String(targetPath).trim() !== '') {
+    const rawStr = String(targetPath).trim();
+    const candidate = path.isAbsolute(rawStr) ? path.resolve(rawStr) : path.resolve(archiveRoot, rawStr);
+    resolved =
+      (await verifyContainedRealPath(candidate, archiveRoot, { allowRootDir: true })) ||
+      (await findArchivedFile(rawStr));
+
+    if (!resolved) {
+      const err = new Error('Path outside archive directory or not found');
+      err.statusCode = 403;
+      throw err;
     }
+  } else {
+    if (!fs.existsSync(archiveRoot)) {
+      await fs.promises.mkdir(archiveRoot, { recursive: true });
+    }
+    resolved = await fs.promises.realpath(archiveRoot);
   }
 
+  // Never spawn GUI file-explorer windows during automated test suites
+  if (isTestMode()) {
+    return resolved;
+  }
+
+  const stat = await fs.promises.stat(resolved);
   if (process.platform === 'win32') {
-    const stat = fs.statSync(resolved);
     if (stat.isDirectory()) {
-      spawn('explorer.exe', [resolved], { detached: true, stdio: 'ignore' }).unref();
+      spawn('explorer.exe', [resolved], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
     } else {
-      spawn('explorer.exe', [`/select,${resolved}`], { detached: true, stdio: 'ignore' }).unref();
+      spawn('explorer.exe', [`/select,${resolved}`], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
     }
   } else if (process.platform === 'darwin') {
-    const stat = fs.statSync(resolved);
     if (stat.isDirectory()) {
       spawn('open', [resolved], { detached: true, stdio: 'ignore' }).unref();
     } else {
       spawn('open', ['-R', resolved], { detached: true, stdio: 'ignore' }).unref();
     }
   } else {
-    const stat = fs.statSync(resolved);
     const dir = stat.isDirectory() ? resolved : path.dirname(resolved);
     spawn('xdg-open', [dir], { detached: true, stdio: 'ignore' }).unref();
   }
@@ -141,6 +234,39 @@ const MIME_TYPES = {
 const tasks = new Map();
 const sseSubscribers = new Map(); // taskId -> Set of res
 
+class AsyncSemaphore {
+  constructor(getMax) {
+    this.getMax = typeof getMax === 'function' ? getMax : () => getMax;
+    this.current = 0;
+    this.queue = [];
+  }
+
+  async acquire() {
+    const limit = Math.max(1, this.getMax());
+    if (this.current < limit && this.queue.length === 0) {
+      this.current++;
+      return;
+    }
+    return new Promise((resolve) => this.queue.push(resolve));
+  }
+
+  release() {
+    this.current = Math.max(0, this.current - 1);
+    const limit = Math.max(1, this.getMax());
+    while (this.queue.length > 0 && this.current < limit) {
+      this.current++;
+      const next = this.queue.shift();
+      next();
+    }
+  }
+}
+
+const webDownloadSemaphore = new AsyncSemaphore(() => config.maxConcurrentDownloads || 3);
+
+function isTerminalStage(stage) {
+  return stage === 'completed' || stage === 'error';
+}
+
 function broadcastTaskUpdate(taskId, update) {
   const task = tasks.get(taskId);
   if (!task) return;
@@ -150,12 +276,44 @@ function broadcastTaskUpdate(taskId, update) {
   const listeners = sseSubscribers.get(taskId);
   if (listeners && listeners.size > 0) {
     const payload = `data: ${JSON.stringify(task)}\n\n`;
+    const shouldClose = isTerminalStage(task.stage);
     for (const res of listeners) {
       try {
         res.write(payload);
+        if (shouldClose) {
+          res.end();
+        }
       } catch {}
     }
+    if (shouldClose) {
+      sseSubscribers.delete(taskId);
+    }
   }
+}
+
+function getCorsOriginHeader(req) {
+  const origin = req.headers.origin;
+  if (!origin) return 'http://127.0.0.1';
+  if (/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(origin)) {
+    return origin;
+  }
+  return 'null';
+}
+
+function checkWebAuth(req, parsedUrl) {
+  const expected = config.webAuthToken;
+  if (!expected) return true;
+
+  const authHeader = req.headers.authorization || '';
+  const bearerToken = authHeader.toLowerCase().startsWith('bearer ')
+    ? authHeader.slice(7).trim()
+    : '';
+  const headerToken = req.headers['x-auth-token'] || '';
+  const queryToken = parsedUrl.searchParams.get('token') || '';
+  const candidate = String(bearerToken || headerToken || queryToken);
+
+  if (!candidate || candidate.length !== expected.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(candidate), Buffer.from(expected));
 }
 
 function parseJsonBody(req) {
@@ -171,7 +329,7 @@ function parseJsonBody(req) {
     req.on('end', () => {
       try {
         resolve(body ? JSON.parse(body) : {});
-      } catch (err) {
+      } catch {
         reject(new Error('Invalid JSON payload'));
       }
     });
@@ -179,21 +337,37 @@ function parseJsonBody(req) {
   });
 }
 
-function sendJson(res, statusCode, data) {
+function sendJson(req, res, statusCode, data) {
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Origin': getCorsOriginHeader(req),
   });
   res.end(JSON.stringify(data));
 }
 
-function serveStaticFile(req, res, reqPath) {
-  let relativePath = reqPath === '/' ? 'index.html' : reqPath.replace(/^\/+/, '');
-  // Sanitize path to prevent directory traversal
-  const safePath = path.normalize(relativePath).replace(/^(\.\.[\/\\])+/, '');
-  const filePath = path.join(PUBLIC_DIR, safePath);
+function pipeStreamSafely(req, res, filePath, options = undefined) {
+  const stream = fs.createReadStream(filePath, options);
+  const cleanup = () => {
+    if (!stream.destroyed) stream.destroy();
+  };
+  req.once('close', cleanup);
+  res.once('close', cleanup);
+  stream.on('error', () => {
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+    }
+    res.end();
+  });
+  stream.pipe(res);
+}
 
-  if (!filePath.startsWith(PUBLIC_DIR)) {
+function serveStaticFile(req, res, reqPath) {
+  const relativePath = reqPath === '/' ? 'index.html' : reqPath.replace(/^\/+/, '');
+  const safePath = path.normalize(relativePath).replace(/^(\.\.[\/\\])+/, '');
+  const filePath = path.resolve(PUBLIC_DIR, safePath);
+  const relToPublic = path.relative(PUBLIC_DIR, filePath);
+
+  if (relToPublic.startsWith('..') || path.isAbsolute(relToPublic)) {
     res.writeHead(403, { 'Content-Type': 'text/plain' });
     res.end('403 Forbidden');
     return;
@@ -215,8 +389,37 @@ function serveStaticFile(req, res, reqPath) {
       'Cache-Control': 'no-cache',
     });
 
-    fs.createReadStream(filePath).pipe(res);
+    pipeStreamSafely(req, res, filePath);
   });
+}
+
+function parseHttpByteRange(rangeHeader, fileSize) {
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(String(rangeHeader).trim());
+  if (!match) return { valid: false };
+
+  const [, startStr, endStr] = match;
+  if (!startStr && !endStr) return { valid: false };
+
+  let start;
+  let end;
+  if (!startStr) {
+    // Suffix byte-range-spec: bytes=-500
+    const suffixLen = parseInt(endStr, 10);
+    if (!Number.isFinite(suffixLen) || suffixLen <= 0 || fileSize === 0) {
+      return { valid: false };
+    }
+    start = Math.max(0, fileSize - suffixLen);
+    end = fileSize - 1;
+  } else {
+    start = parseInt(startStr, 10);
+    end = endStr ? parseInt(endStr, 10) : fileSize - 1;
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || start >= fileSize || start > end) {
+      return { valid: false };
+    }
+    end = Math.min(end, fileSize - 1);
+  }
+
+  return { valid: true, start, end };
 }
 
 async function handleDownloadFile(req, res, query) {
@@ -227,11 +430,8 @@ async function handleDownloadFile(req, res, query) {
     return;
   }
 
-  const archiveRoot = path.resolve(config.archiveDirectory);
   const resolvedPath = await findArchivedFile(targetFile);
-
-  // Security guard: Ensure file exists and is inside archiveDirectory or cwd
-  if (!resolvedPath || (!resolvedPath.startsWith(archiveRoot) && !resolvedPath.startsWith(path.resolve(process.cwd())))) {
+  if (!resolvedPath) {
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('404 File Not Found');
     return;
@@ -248,12 +448,20 @@ async function handleDownloadFile(req, res, query) {
     const contentType = MIME_TYPES[ext] || 'application/octet-stream';
     const filename = path.basename(resolvedPath);
 
-    // Support HTTP range requests for media streaming (video/audio seeking)
+    // Support RFC 7233 HTTP range requests for media streaming (video/audio seeking)
     const range = req.headers.range;
     if (range) {
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : stats.size - 1;
+      const parsedRange = parseHttpByteRange(range, stats.size);
+      if (!parsedRange.valid) {
+        res.writeHead(416, {
+          'Content-Range': `bytes */${stats.size}`,
+          'Content-Type': 'text/plain',
+        });
+        res.end('416 Range Not Satisfiable');
+        return;
+      }
+
+      const { start, end } = parsedRange;
       const chunkSize = end - start + 1;
 
       res.writeHead(206, {
@@ -263,7 +471,7 @@ async function handleDownloadFile(req, res, query) {
         'Content-Type': contentType,
       });
 
-      fs.createReadStream(resolvedPath, { start, end }).pipe(res);
+      pipeStreamSafely(req, res, resolvedPath, { start, end });
     } else {
       const isDownload = query.get('download') === '1';
       const headers = {
@@ -277,7 +485,7 @@ async function handleDownloadFile(req, res, query) {
       }
 
       res.writeHead(200, headers);
-      fs.createReadStream(resolvedPath).pipe(res);
+      pipeStreamSafely(req, res, resolvedPath);
     }
   });
 }
@@ -285,14 +493,14 @@ async function handleDownloadFile(req, res, query) {
 function handleHistory(req, res, query) {
   try {
     const db = getDb();
-    const limit = Math.min(100, Math.max(1, parseInt(query.get('limit') || '50', 10)));
-    const offset = Math.max(0, parseInt(query.get('offset') || '0', 10));
+    const limit = Math.min(100, Math.max(1, parseInt(query.get('limit') || '50', 10) || 50));
+    const offset = Math.max(0, parseInt(query.get('offset') || '0', 10) || 0);
     const searchQuery = query.get('q')?.trim();
 
     let rows;
     if (searchQuery) {
       const stmt = db.prepare(`
-        SELECT id, media_id, sha256, duration, hash, original_url, title, posted_by, channel, archived_at, file_name
+        SELECT id, media_id, sha256, duration, hash, original_url, title, posted_by, channel, archived_at, file_name, relative_path, file_size
         FROM media_records
         WHERE title LIKE ? OR original_url LIKE ? OR file_name LIKE ?
         ORDER BY id DESC
@@ -302,7 +510,7 @@ function handleHistory(req, res, query) {
       rows = stmt.all(term, term, term, limit, offset);
     } else {
       const stmt = db.prepare(`
-        SELECT id, media_id, sha256, duration, hash, original_url, title, posted_by, channel, archived_at, file_name
+        SELECT id, media_id, sha256, duration, hash, original_url, title, posted_by, channel, archived_at, file_name, relative_path, file_size
         FROM media_records
         ORDER BY id DESC
         LIMIT ? OFFSET ?
@@ -310,9 +518,9 @@ function handleHistory(req, res, query) {
       rows = stmt.all(limit, offset);
     }
 
-    sendJson(res, 200, { ok: true, records: rows });
+    sendJson(req, res, 200, { ok: true, records: rows });
   } catch (err) {
-    sendJson(res, 500, { ok: false, error: err.message });
+    sendJson(req, res, 500, { ok: false, error: err.message });
   }
 }
 
@@ -321,7 +529,7 @@ async function handleApiDownload(req, res) {
     const body = await parseJsonBody(req);
     const url = body.url?.trim();
     if (!url) {
-      return sendJson(res, 400, { ok: false, error: 'URL is required' });
+      return sendJson(req, res, 400, { ok: false, error: 'URL is required' });
     }
 
     const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
@@ -340,15 +548,22 @@ async function handleApiDownload(req, res) {
 
     tasks.set(taskId, task);
 
-    // Limit in-memory tasks to last 100
-    if (tasks.size > 100) {
+    // Bound in-memory tasks to MAX_TASKS (200)
+    while (tasks.size > MAX_TASKS) {
       const oldestKey = tasks.keys().next().value;
       tasks.delete(oldestKey);
+      sseSubscribers.delete(oldestKey);
     }
 
-    // Start background processing
+    // Start bounded background processing
     (async () => {
+      await webDownloadSemaphore.acquire();
       try {
+        broadcastTaskUpdate(taskId, {
+          stage: 'downloading',
+          message: 'Starting download...',
+        });
+
         const result = await downloadMediaItem(url, {
           audioOnly: task.audioOnly,
           force: task.force,
@@ -356,8 +571,10 @@ async function handleApiDownload(req, res) {
           author: 'WebUI',
           channel: 'web',
           onProgress: (prog) => {
+            // Avoid premature terminal SSE closure before final result payload is attached
+            const interimStage = prog.stage === 'completed' ? 'finalizing' : prog.stage;
             broadcastTaskUpdate(taskId, {
-              stage: prog.stage,
+              stage: interimStage,
               message: prog.message,
               data: prog.data,
             });
@@ -380,12 +597,14 @@ async function handleApiDownload(req, res) {
           message: err.message || 'Download failed',
           error: err.message || String(err),
         });
+      } finally {
+        webDownloadSemaphore.release();
       }
     })();
 
-    sendJson(res, 202, { ok: true, taskId });
+    sendJson(req, res, 202, { ok: true, taskId });
   } catch (err) {
-    sendJson(res, 400, { ok: false, error: err.message });
+    sendJson(req, res, 400, { ok: false, error: err.message });
   }
 }
 
@@ -401,16 +620,22 @@ function handleProgressSse(req, res, taskId) {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Origin': getCorsOriginHeader(req),
   });
+
+  // Send current state immediately
+  res.write(`data: ${JSON.stringify(task)}\n\n`);
+
+  // If the task already finished before the SSE client subscribed, close cleanly right away
+  if (isTerminalStage(task.stage)) {
+    res.end();
+    return;
+  }
 
   if (!sseSubscribers.has(taskId)) {
     sseSubscribers.set(taskId, new Set());
   }
   sseSubscribers.get(taskId).add(res);
-
-  // Send current state immediately
-  res.write(`data: ${JSON.stringify(task)}\n\n`);
 
   req.on('close', () => {
     const listeners = sseSubscribers.get(taskId);
@@ -431,11 +656,17 @@ export function createWebServer() {
     // CORS preflight
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Origin': getCorsOriginHeader(req),
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Auth-Token',
       });
       res.end();
+      return;
+    }
+
+    // Optional bearer/token authentication on API routes when WEB_AUTH_TOKEN is configured
+    if (pathname.startsWith('/api/') && !checkWebAuth(req, parsedUrl)) {
+      sendJson(req, res, 401, { ok: false, error: 'Unauthorized' });
       return;
     }
 
@@ -452,7 +683,7 @@ export function createWebServer() {
     }
 
     if (pathname === '/api/tasks' && req.method === 'GET') {
-      sendJson(res, 200, { ok: true, tasks: Array.from(tasks.values()).slice(-20).reverse() });
+      sendJson(req, res, 200, { ok: true, tasks: Array.from(tasks.values()).slice(-20).reverse() });
       return;
     }
 
@@ -467,18 +698,23 @@ export function createWebServer() {
     }
 
     if (pathname === '/api/open-folder' && req.method === 'POST') {
+      if (!isLoopbackAddress(req.socket?.remoteAddress)) {
+        sendJson(req, res, 403, { ok: false, error: 'Host folder opening is restricted to loopback clients' });
+        return;
+      }
       try {
         const body = await parseJsonBody(req);
         const opened = await openFolderOrFile(body.path);
-        sendJson(res, 200, { ok: true, openedPath: opened });
+        sendJson(req, res, 200, { ok: true, openedPath: opened });
       } catch (err) {
-        sendJson(res, 500, { ok: false, error: err.message });
+        const status = err.statusCode || 500;
+        sendJson(req, res, status, { ok: false, error: err.message });
       }
       return;
     }
 
     if (pathname === '/api/status' && req.method === 'GET') {
-      sendJson(res, 200, {
+      sendJson(req, res, 200, {
         ok: true,
         version: config.version,
         archiveDirectory: config.archiveDirectory,
