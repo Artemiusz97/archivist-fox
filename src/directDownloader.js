@@ -121,7 +121,9 @@ export async function downloadDirect(url, destDir, maxBytes, options = {}) {
     } catch {
       try {
         rawBase = path.basename(new URL(url).pathname) || rawBase;
-      } catch {}
+      } catch (err) {
+    void err;
+  }
     }
   }
 

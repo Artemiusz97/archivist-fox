@@ -12,6 +12,30 @@ function isValidCookieFile(filePath) {
   }
 }
 
+function hasBilibiliAuthCookie(filePath) {
+  try {
+    if (!isValidCookieFile(filePath)) return false;
+    const raw = fs.readFileSync(filePath, 'utf8');
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || (trimmed.startsWith('#') && !trimmed.startsWith('#HttpOnly_'))) continue;
+      const normalizedLine = trimmed.startsWith('#HttpOnly_') ? trimmed.slice(10) : trimmed;
+      const cols = normalizedLine.split('\t');
+      if (
+        cols.length >= 7 &&
+        cols[0].toLowerCase().includes('bilibili.com') &&
+        cols[5] === 'SESSDATA' &&
+        cols[6].trim().length > 0
+      ) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Returns the best matching cookie file path for a given media URL.
  * Checks for dedicated platform cookies in `cookies/<platform>.txt` before
@@ -21,6 +45,7 @@ function isValidCookieFile(filePath) {
  * @returns {string|null} Path to valid cookie file, or null if none found
  */
 export function getCookieForUrl(url) {
+  let targetSite = null;
   try {
     const cookiesDir = config.cookiesDir || path.join(process.cwd(), 'cookies');
     if (!fs.existsSync(cookiesDir)) {
@@ -30,8 +55,6 @@ export function getCookieForUrl(url) {
     if (url) {
       const parsed = new URL(url);
       const hostname = parsed.hostname.toLowerCase();
-
-      let targetSite = null;
       if (hostname.includes('youtube.com') || hostname.includes('youtu.be')) {
         targetSite = 'youtube';
       } else if (hostname.includes('twitter.com') || hostname.includes('x.com')) {
@@ -52,7 +75,7 @@ export function getCookieForUrl(url) {
         targetSite = 'pixiv';
       } else if (hostname.includes('twitch.tv')) {
         targetSite = 'twitch';
-      } else if (hostname.includes('bilibili.com')) {
+      } else if (hostname.includes('bilibili.com') || hostname === 'b23.tv' || hostname.endsWith('.b23.tv')) {
         targetSite = 'bilibili';
       } else if (hostname.includes('deviantart.com') || hostname === 'fav.me' || hostname === 'sta.sh') {
         targetSite = 'deviantart';
@@ -70,21 +93,27 @@ export function getCookieForUrl(url) {
 
         for (const filename of candidateNames) {
           const platformCookie = path.join(cookiesDir, filename);
-          if (isValidCookieFile(platformCookie)) {
+          const valid =
+            targetSite === 'bilibili' ? hasBilibiliAuthCookie(platformCookie) : isValidCookieFile(platformCookie);
+          if (valid) {
             return platformCookie;
           }
         }
       }
     }
-  } catch {}
+  } catch (err) {
+    void err;
+  }
 
   // Fallback to configured global cookiesPath or root cookies.txt
-  if (isValidCookieFile(config.cookiesPath)) {
+  const isFallbackValid = (fp) => (targetSite === 'bilibili' ? hasBilibiliAuthCookie(fp) : isValidCookieFile(fp));
+
+  if (isFallbackValid(config.cookiesPath)) {
     return config.cookiesPath;
   }
 
   const rootCookie = path.join(process.cwd(), 'cookies.txt');
-  if (isValidCookieFile(rootCookie)) {
+  if (isFallbackValid(rootCookie)) {
     return rootCookie;
   }
 

@@ -2,42 +2,82 @@
 
 [![Support on Ko-fi](https://img.shields.io/badge/Support_on_Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/artemszafik)
 
-A Discord bot that watches messages for media links — either direct file
-links (`.jpg`, `.mp4`, `.mp3`, etc.), social platform posts & art galleries
-(Twitter/X, TikTok, Instagram, Reddit, DeviantArt, and more), or audio/music
-tracks (SoundCloud, Bandcamp, Mixcloud, Audiomack, YouTube Music) — downloads
-the media, and replies to the original poster with it as a file attachment.
+Archivist Fox is a self-hosted Discord bot that watches channels for media links (like videos, images, and audio tracks), downloads the original files, and uploads them directly into the Discord chat so everyone can watch or view them immediately. At the same time, it saves a copy of every file to your computer's hard drive so you have a permanent offline backup of everything shared in your server.
 
-## 🦊 Unique & Standout Features
+---
 
-Archivist Fox is designed not just as a link re-uploader, but as an autonomous, high-fidelity media archivist and disaster recovery system for Discord communities:
+## What Does This Bot Do?
 
-- **Cascading 4-Tier Perceptual Deduplication Engine**:
-  - Eliminates redundant downloads and Discord repost clutter using a cascading multi-factor filter: **Tier 1** Canonical Platform Media ID $\rightarrow$ **Tier 2** Cryptographic SHA-256 byte digest $\rightarrow$ **Tier 3** Video duration gating (rejects mismatches $> 1.5$s) $\rightarrow$ **Tier 4** Multi-frame perceptual visual hashing (dHash) powered by SWAR bitwise parallel popcount arithmetic with flat-hash rejection.
-- **Permanent Local PC Archiving & User Attachment Backup**:
-  - Automatically saves full-fidelity uncompressed media to your local PC or NAS with structured subfolders (`channel/date`, `date/channel`, or `channel`) and comprehensive `.json` metadata sidecars.
-  - **User Message Attachment Archiving (`ARCHIVE_USER_ATTACHMENTS=true`)**: Automatically backs up media files manually attached or uploaded by users directly in chat—preserving photos, videos, and art even if the user later deletes their message.
-  - **Idempotent Storage Engine**: Pre-copy identity verification avoids duplicate copies during historical rescans or forced re-uploads.
-- **Dual-Format High-Fidelity GIF Pipeline**:
-  - Solves the modern web dilemma where Twitter/Reddit "GIFs" are silent MP4s: generates full-resolution, high-fidelity `.gif` files using FFmpeg two-pass custom palette generation (`sierra2_4a`).
-  - **Adaptive Discord Fallback**: Uploads as a native looping `.gif` when within your server's upload limit, or seamlessly falls back to crisp `.mp4` for Discord delivery while keeping **both** formats in your local archive.
-- **YouTube 4K, 8K & Premium Bitrate Upgrade Engine**:
-  - Built-in upgrade utility (`npm run redownload-youtube` / `src/youtubeUpgrader.js`) to retroactively audit and re-download archived YouTube videos in maximum resolution (4K/8K) or YouTube Premium 1080p Enhanced Bitrate with concurrent fragment acceleration (`-N 4`) and direct browser cookie extraction.
-- **Instant Subprocess Abortion (`/stop` & `!stop`)**:
-  - Deep `AbortController` / `AbortSignal` propagation terminates active downloader subprocess trees (`taskkill` on Windows, process group `SIGKILL` on POSIX) immediately—halting active `yt-dlp`, `gallery-dl`, HTTP streams, and FFmpeg tasks without waiting for timeouts.
-- **Self-Hosted Web Dashboard & Direct Downloader**:
-  - Browser-based control center (`http://localhost:3000`) featuring live Server-Sent Events (SSE) download progress, media player with RFC 7233 partial content range streaming (`HTTP 206`), Windows File Explorer shortcuts, path traversal security containment, and optional `WEB_AUTH_TOKEN` authentication.
-- **Link Backup & Channel Disaster Recovery Suite**:
-  - Export server links into structured Master JSON, per-channel JSON, formatted Markdown tables, or CSV spreadsheets (`/export-links`).
-  - Automated channel link restoration (`/restore` or `!restore`) that reposts links sequentially with rate-limit safe pacing, original author attribution, and automatic channel recreation if channels were accidentally deleted.
+When people share links to videos or pictures in Discord (from Twitter/X, TikTok, Reddit, Instagram, YouTube, Bilibili, etc.), embeds are often broken, links can stop working when posts are deleted, or people have to leave Discord to watch them.
+
+Here is how Archivist Fox handles that:
+
+1. **Re-uploads Media Directly into Chat**: When someone drops a supported link in a channel, the bot downloads the actual video or image file and attaches it right under the user's message. Everyone can play the video or view the image directly in Discord without opening external browser tabs, dealing with broken embeds, or watching website ads.
+2. **Backs Up Everything to Your Computer**: Every video, picture, song, and subtitle file the bot downloads is automatically saved into organized folders on your PC (sorted by channel name and date). It also saves a text/JSON file alongside each download recording who posted it, the timestamp, and the original link.
+3. **Saves User-Uploaded Attachments**: If someone in your server uploads a photo, video, or audio file directly to Discord from their phone or computer, the bot silently downloads and saves a copy to your PC as well. Even if the user deletes their message or leaves the server, the file stays safe on your hard drive.
+4. **Prevents Duplicate Re-posts**: If someone shares a link to a video or picture that was already posted in the channel earlier, the bot compares the file's ID, byte fingerprint, duration, and visual frames. If it has already been posted, the bot skips uploading it so your chat doesn't get flooded with duplicate media.
+5. **Compresses Oversized Videos**: Discord restricts how big uploaded files can be (for example, 10 MB on non-boosted servers). If a video is larger than your server's upload limit, the bot uses ffmpeg to re-compress the video so it fits within the limit, using your computer's graphics card (NVIDIA, Intel, AMD) if available.
+
+---
+
+## 🦊 All Unique Features Explained
+
+Here is an overview of what the bot can do and how each feature works:
+
+- **Automatic Video & Image Re-uploading**:
+  - Watches channels for links from Twitter/X, TikTok, Instagram, Reddit, YouTube, Bilibili, Pinterest, Pixiv, DeviantArt, SoundCloud, Bandcamp, Mixcloud, Audiomack, YouTube Music, and direct file links (`.mp4`, `.jpg`, `.png`, `.mp3`, etc.).
+  - Downloads the media and replies to the message with the file attached so people can view it directly in chat.
+- **Smart Duplicate Detection (Visual & Audio Hashing)**:
+  - If someone posts a link that was already shared, the bot checks four things in order: the platform post ID, an exact file byte match (SHA-256), the video duration (rejecting mismatches greater than 1.5 seconds), and a visual frame hash (dHash).
+  - If the content is identical, the bot skips re-uploading and can optionally send a temporary notice with a one-click button to delete the duplicate post.
+- **Permanent Local PC Archiving**:
+  - Automatically saves the original, full-resolution files to your local `./archives` folder.
+  - Generates a matching `.json` metadata file for each download containing the post title, who posted it, the channel name, the date, and the original link.
+  - Automatically checks if an identical file was already saved before creating new files, avoiding duplicate copies on your hard drive.
+- **Direct User Attachment Backup**:
+  - Automatically detects media files that users attach or upload directly to Discord (photos, videos, audio, GIFs) in allowed channels.
+  - Silently downloads and preserves them into your local archive without posting an extra reply to chat.
+- **Real Looping GIFs from Twitter & Reddit**:
+  - Social media sites like Twitter/X and Reddit actually store "GIFs" as silent MP4 video clips.
+  - When someone posts one of these, the bot converts the clip into an actual animated `.gif` file using two-pass palette generation so it plays continuously on loop in Discord chat.
+  - If the generated `.gif` exceeds Discord's file size limit, the bot uploads an MP4 instead and keeps both the `.gif` and `.mp4` on your computer.
+- **Bilibili Video Support with Automatic Quality Fallback**:
+  - Supports standard Bilibili links, international locale URLs (like `/en/video/`), mobile links (`m.bilibili.com`), and shortlinks (`b23.tv`).
+  - Automatically strips Bilibili share tracking parameters while preserving multi-part video episode numbers (`?p=`).
+  - Supports Bilibili login cookies (`SESSDATA`). If no login cookies are configured and an unauthenticated 1080p stream cuts off, the bot automatically switches down to 720p so the download succeeds.
+- **YouTube 4K, 8K & Premium Quality Upgrader**:
+  - Comes with a built-in tool (`npm run redownload-youtube`) that can inspect YouTube videos already in your archive and re-download them at higher resolutions (up to 4K or 8K).
+  - Can read cookies from your local browser (Firefox, Chrome, Edge, Brave) to download YouTube Premium 1080p Enhanced Bitrate streams and 256kbps Opus audio.
+- **YouTube Playlists with Interactive Buttons**:
+  - When someone posts a YouTube playlist link, the bot displays buttons asking whether to download just the single video or the whole playlist up to a configurable limit.
+  - Can automatically create a separate Discord thread for playlist uploads to avoid filling up the main channel.
+- **Subtitle & Caption Extraction**:
+  - Can automatically download creator-provided subtitles or auto-generated captions for YouTube and other video platforms in `.srt` or `.vtt` format.
+  - Subtitles are stored with the video on your computer, and can optionally be uploaded to Discord (bundling into a `.zip` file if there are many languages).
+- **Self-Hosted Web Dashboard & Media Player**:
+  - Includes a web browser interface (`http://localhost:3000`) where you can paste any link to download it directly to your PC, browse your archived files, view images, and play videos/audio with fast seeking support.
+  - Can be locked down with a security token (`WEB_AUTH_TOKEN`) if accessed over a local network.
+- **Link Backup & Channel Disaster Recovery**:
+  - Automatically records every link posted in your server into a local SQLite database.
+  - You can export all saved links into JSON backup files, Markdown reading lists, or CSV spreadsheets using `/export-links` or the command line.
+  - If a channel is accidentally deleted or wiped, running `/restore` will recreate the channel and repost the saved links in order at a safe, rate-limited pace.
+- **Instant Task Cancellation (`/stop` & `!stop`)**:
+  - If a large download, channel scan, or restoration is running and you want to stop it immediately, running `/stop` instantly kills the active download processes on your computer and clears any queued tasks.
+- **Automatic Offline Catch-Up**:
+  - If the bot wasn't running (for example, while your computer was turned off overnight), it automatically scans the messages sent during the downtime (up to 24 hours back by default) when started up, downloading any missed media.
+- **Historical Channel Scanner (`/rescan` or `!rescan`)**:
+  - Allows server moderators to crawl the message history of a channel or the entire server to download and archive older media links to your computer.
+- **Auto-Spoilering for Sensitive & Adult Content**:
+  - Automatically checks links against known adult domains and metadata flags (`nsfw`, `18+`, `r-18`, etc.).
+  - Media flagged as adult content or posted by users inside spoiler tags (`||https://...||`) is automatically uploaded to Discord with a spoiler blur.
 - **Anti-Bot & Rate-Limit Hardening**:
-  - Browser fingerprint impersonation (`chrome`, `firefox`, `safari`), human reaction jitter delays (1.5s–3.5s), automated domain request pacing (600ms–1100ms), and DNS-level SSRF defense.
-- **Automated Offline Catch-Up & Crawler**:
-  - Automatically crawls messages posted while your PC was offline upon bot startup (`AUTO_SCAN_ON_STARTUP=true`), and provides interactive server-wide historical crawling (`/rescan`).
+  - Mimics regular browser headers and fingerprints (`chrome`, `firefox`, `safari`), adds randomized human-like delays, and paces requests to the same website so your IP address doesn't get blocked by social media sites.
 - **Zero-Dependency Native Verification Suite**:
-  - Fully covered by **173 native unit and integration tests across 77 suites** with zero third-party test dependencies.
+  - Includes **190 unit and integration tests across 85 suites** using Node.js's built-in test runner, verifying all downloaders, database queries, and security features without external testing packages.
 
-## How it works
+---
+
+## How It Works Under the Hood
 
 1. On every message, the bot scans for URLs.
 2. Direct media URLs (ending in a known image/video extension) are downloaded directly.
@@ -352,7 +392,7 @@ npm run redownload-youtube
 
 ## Running Tests
 
-Archivist Fox includes a comprehensive native test suite with **173 unit and integration tests across 77 suites** covering commands, configuration, database operations, cascading deduplication, SSRF security, Web UI Range streaming, dual-format GIF processing, idempotent archiving, task cancellation (`/stop`), export formatting, URL extraction, and YouTube quality upgrading:
+Archivist Fox includes a comprehensive native test suite with **190 unit and integration tests across 85 suites** covering commands, configuration, database operations, cascading deduplication, SSRF security, Web UI Range streaming, dual-format GIF processing, idempotent archiving, task cancellation (`/stop`), export formatting, URL extraction, and YouTube quality upgrading:
 
 ```bash
 # Run all tests

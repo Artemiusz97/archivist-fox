@@ -15,6 +15,7 @@ const SHORTENER_HOSTS = new Set([
   'ow.ly',
   'on.soundcloud.com',
   'fav.me',  // DeviantArt shortlink (resolves to deviantart.com/USER/art/SLUG-ID)
+  'b23.tv',  // Bilibili shortlink (resolves to bilibili.com/video/BV...)
 ]);
 
 const DIRECT_MEDIA_EXTENSIONS = new Set([
@@ -50,7 +51,7 @@ const PLATFORM_DOMAINS = [
   'redgifs.com',
   'pixiv.net',
   'pinterest.com', 'pin.it',
-  'bilibili.com',
+  'bilibili.com', 'b23.tv',
   'soundcloud.com', 'm.soundcloud.com',
   'bandcamp.com',
   'mixcloud.com',
@@ -234,6 +235,78 @@ const TRACKING_PARAMS = new Set([
   'dclid',
 ]);
 
+const BILIBILI_WEB_HOSTS = new Set([
+  'bilibili.com',
+  'www.bilibili.com',
+  'm.bilibili.com',
+  'mobile.bilibili.com',
+]);
+
+const BILIBILI_LOCALE_VIDEO_PATH_REGEX =
+  /^\/(?:(?:[a-z]{2,3}(?:-[a-z0-9]{2,8})?|s)\/)?(video\/|bangumi\/play\/)/i;
+
+const BILIBILI_TRACKING_PARAMS = new Set([
+  'vd_source',
+  'spm_id_from',
+  'from_spmid',
+  'share_source',
+  'share_medium',
+  'share_plat',
+  'share_session_id',
+  'share_tag',
+  'share_times',
+  'unique_k',
+  'is_story_h5',
+  'buvid',
+  'up_id',
+  'plat_id',
+]);
+
+/**
+ * Canonicalizes Bilibili video/bangumi URLs so `yt-dlp`'s `BiliBiliIE` matches
+ * instead of falling back to the generic HTML extractor on locale/SEO prefixes
+ * (e.g. `/en/video/BV...`, `/zh-Hans/video/BV...`, `/s/video/BV...`, `m.bilibili.com`)
+ * or direct `b23.tv/BV...` vanity links. Leaves subdomains like `live.bilibili.com` untouched.
+ *
+ * @param {string} rawUrl
+ * @returns {string}
+ */
+export function canonicalizeBilibiliUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return rawUrl;
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return rawUrl;
+    }
+    const host = parsed.hostname.toLowerCase();
+
+    if (host === 'b23.tv' || host === 'www.b23.tv') {
+      const bvMatch = parsed.pathname.match(/^\/(BV[a-zA-Z0-9]{10})(\/?)$/i);
+      if (bvMatch) {
+        const normalizedBv = `BV${bvMatch[1].slice(2)}`;
+        parsed.protocol = 'https:';
+        parsed.hostname = 'www.bilibili.com';
+        parsed.pathname = `/video/${normalizedBv}${bvMatch[2] || ''}`;
+        return parsed.toString();
+      }
+      return rawUrl;
+    }
+
+    if (BILIBILI_WEB_HOSTS.has(host) && BILIBILI_LOCALE_VIDEO_PATH_REGEX.test(parsed.pathname)) {
+      parsed.protocol = 'https:';
+      parsed.hostname = 'www.bilibili.com';
+      parsed.pathname = parsed.pathname.replace(
+        /^\/(?:[a-z]{2,3}(?:-[a-z0-9]{2,8})?|s)\/(video\/|bangumi\/play\/)/i,
+        '/$1'
+      );
+      return parsed.toString();
+    }
+  } catch (err) {
+    void err;
+  }
+  return rawUrl;
+}
+
 export function stripQueryAndTrailingPunctuation(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return '';
   // Strip common trailing punctuation, backslashes, angle brackets, and Discord markdown delimiters (` * ~)
@@ -307,6 +380,23 @@ export function normalizeUrl(rawUrl) {
   }
 
   // Special-case twitter / x share params (s, t)
+  if (host === 'b23.tv') {
+    const bvMatch = parsed.pathname.match(/^\/(BV[a-zA-Z0-9]{10})\/?$/i);
+    if (bvMatch) {
+      host = 'bilibili.com';
+      parsed.hostname = host;
+      parsed.pathname = `/video/BV${bvMatch[1].slice(2)}`;
+    }
+  }
+
+  if (parsed.hostname === 'bilibili.com') {
+    parsed.pathname = parsed.pathname.replace(
+      /^\/(?:[a-z]{2,3}(?:-[a-z0-9]{2,8})?|s)\/(video\/|bangumi\/play\/)/i,
+      '/$1'
+    );
+  }
+
+  const isBilibili = parsed.hostname === 'bilibili.com';
   const isTwitter = parsed.hostname === 'twitter.com';
 
   // Filter tracking query params
@@ -317,6 +407,7 @@ export function normalizeUrl(rawUrl) {
     const lowerKey = key.toLowerCase();
     if (TRACKING_PARAMS.has(lowerKey)) continue;
     if (isTwitter && (lowerKey === 's' || lowerKey === 't')) continue;
+    if (isBilibili && BILIBILI_TRACKING_PARAMS.has(lowerKey)) continue;
     filteredParams.push([key, value]);
   }
 
@@ -353,7 +444,7 @@ export function extractAllUrls(content) {
   const seenNormalized = new Set();
 
   for (const raw of rawMatches) {
-    const cleaned = stripQueryAndTrailingPunctuation(raw);
+    const cleaned = canonicalizeBilibiliUrl(stripQueryAndTrailingPunctuation(raw));
     const normalized = normalizeUrl(cleaned);
     if (!normalized) continue;
     if (seenNormalized.has(normalized)) continue;
@@ -565,7 +656,9 @@ export function extractPlatformMediaId(rawUrl) {
       const match = pathname.match(/^\/attachments\/\d+\/(\d+)\//i);
       if (match) return `discord:${match[1]}`;
     }
-  } catch {}
+  } catch (err) {
+    void err;
+  }
 
   return null;
 }
@@ -600,7 +693,9 @@ export function isAudioUrl(rawUrl) {
       const audioExts = new Set(['mp3', 'ogg', 'wav', 'flac', 'm4a', 'opus', 'aac', 'alac', 'aiff']);
       return audioExts.has(checkExt);
     }
-  } catch {}
+  } catch (err) {
+    void err;
+  }
   return false;
 }
 
@@ -692,7 +787,9 @@ export async function resolveShortUrl(rawUrl) {
       await validateSsrfTarget(currentUrl);
       return currentUrl;
     }
-  } catch {}
+  } catch (err) {
+    void err;
+  }
   return rawUrl;
 }
 
@@ -720,7 +817,7 @@ export function extractMediaLinks(content) {
 
   for (const match of rawMatches) {
     const raw = match[0];
-    const cleaned = stripQueryAndTrailingPunctuation(raw);
+    const cleaned = canonicalizeBilibiliUrl(stripQueryAndTrailingPunctuation(raw));
     if (seen.has(cleaned)) continue;
     seen.add(cleaned);
 
@@ -759,8 +856,8 @@ export async function extractAllUrlsAsync(content) {
 
   const resolvedUrls = await Promise.all(
     rawMatches.map(async (raw) => {
-      const cleaned = stripQueryAndTrailingPunctuation(raw);
-      return resolveShortUrl(cleaned);
+      const cleaned = canonicalizeBilibiliUrl(stripQueryAndTrailingPunctuation(raw));
+      return canonicalizeBilibiliUrl(await resolveShortUrl(cleaned));
     })
   );
 
@@ -799,7 +896,8 @@ export async function extractMediaLinksAsync(content) {
     })
   );
 
-  for (const { resolved: cleaned, isSpoiler } of resolvedUrls) {
+  for (const { resolved, isSpoiler } of resolvedUrls) {
+    const cleaned = canonicalizeBilibiliUrl(stripQueryAndTrailingPunctuation(resolved));
     if (seen.has(cleaned)) continue;
     seen.add(cleaned);
 
@@ -861,7 +959,9 @@ export function isMediaAttachment(att) {
   if (!ext) {
     try {
       ext = getExtension(new URL(url).pathname);
-    } catch {}
+    } catch (err) {
+    void err;
+  }
   }
   return Boolean(ext && ATTACHMENT_MEDIA_EXTENSIONS.has(ext));
 }
@@ -907,7 +1007,9 @@ export function extractMessageAttachments(message) {
     if (!rawFilename) {
       try {
         rawFilename = decodeURIComponent(new URL(url).pathname.split('/').pop() || '');
-      } catch {}
+      } catch (err) {
+    void err;
+  }
     }
     const isSpoiler = Boolean(att.spoiler || /^SPOILER_/i.test(rawFilename));
     const cleanFilename = rawFilename.replace(/^(?:SPOILER_)+/i, '') || rawFilename || undefined;
@@ -964,7 +1066,9 @@ export function extractYouTubePlaylistDetails(rawUrl) {
         }
       }
     }
-  } catch {}
+  } catch (err) {
+    void err;
+  }
 
   return result;
 }

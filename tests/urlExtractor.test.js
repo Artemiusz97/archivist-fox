@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import dns from 'node:dns';
+import * as urlExtractorMod from '../src/urlExtractor.js';
 import {
   extractMediaLinks,
   extractMediaLinksAsync,
@@ -77,6 +79,53 @@ describe('urlExtractor', () => {
       assert.strictEqual(links.length, 1);
       assert.strictEqual(links[0].type, 'direct');
       assert.strictEqual(links[0].url, signedCdnUrl);
+    });
+
+    it('canonicalizes locale-prefixed Bilibili URLs and resolves b23.tv shortlinks in media extraction', async () => {
+      assert.strictEqual(
+        urlExtractorMod.canonicalizeBilibiliUrl?.('https://www.bilibili.com/en/video/BV1Fb4y1j7cs/'),
+        'https://www.bilibili.com/video/BV1Fb4y1j7cs/'
+      );
+      assert.strictEqual(
+        urlExtractorMod.canonicalizeBilibiliUrl?.('https://bilibili.com/s/video/BV1Fb4y1j7cs'),
+        'https://www.bilibili.com/video/BV1Fb4y1j7cs'
+      );
+      assert.strictEqual(
+        urlExtractorMod.canonicalizeBilibiliUrl?.('https://www.bilibili.com/en/bangumi/play/ep123456'),
+        'https://www.bilibili.com/bangumi/play/ep123456'
+      );
+
+      const syncLinks = extractMediaLinks(
+        'Watch https://www.bilibili.com/en/video/BV1Fb4y1j7cs/ and https://m.bilibili.com/zh-Hans/video/BV1Fb4y1j7cs?p=2 and https://live.bilibili.com/12345'
+      );
+      assert.strictEqual(syncLinks.length, 3);
+      assert.strictEqual(syncLinks[0].url, 'https://www.bilibili.com/video/BV1Fb4y1j7cs/');
+      assert.strictEqual(syncLinks[0].type, 'platform');
+      assert.strictEqual(syncLinks[1].url, 'https://www.bilibili.com/video/BV1Fb4y1j7cs?p=2');
+      assert.strictEqual(syncLinks[2].url, 'https://live.bilibili.com/12345');
+
+      const origFetch = globalThis.fetch;
+      const origLookup = dns.promises.lookup;
+      try {
+        dns.promises.lookup = async () => [{ address: '93.184.216.34', family: 4 }];
+        globalThis.fetch = async (targetUrl) => {
+          if (String(targetUrl).startsWith('https://b23.tv/6aBcDeF')) {
+            return new Response(null, {
+              status: 302,
+              headers: { location: 'https://www.bilibili.com/en/video/BV1Fb4y1j7cs/' },
+            });
+          }
+          return new Response(null, { status: 200 });
+        };
+
+        const asyncLinks = await extractMediaLinksAsync('Shortlink: https://b23.tv/6aBcDeF');
+        assert.strictEqual(asyncLinks.length, 1);
+        assert.strictEqual(asyncLinks[0].type, 'platform');
+        assert.strictEqual(asyncLinks[0].url, 'https://www.bilibili.com/video/BV1Fb4y1j7cs/');
+      } finally {
+        globalThis.fetch = origFetch;
+        dns.promises.lookup = origLookup;
+      }
     });
   });
 
@@ -186,6 +235,21 @@ describe('urlExtractor', () => {
       );
     });
 
+    it('canonicalizes Bilibili locale/SEO paths, b23.tv BV links, and strips Bilibili share tracking params while preserving ?p=', () => {
+      assert.strictEqual(
+        normalizeUrl('https://www.bilibili.com/en/video/BV1Fb4y1j7cs/'),
+        'https://bilibili.com/video/BV1Fb4y1j7cs'
+      );
+      assert.strictEqual(
+        normalizeUrl('https://m.bilibili.com/zh-Hans/video/BV1Fb4y1j7cs/?spm_id_from=333.337&vd_source=abcdef&p=2'),
+        'https://bilibili.com/video/BV1Fb4y1j7cs?p=2'
+      );
+      assert.strictEqual(
+        normalizeUrl('https://b23.tv/BV1Fb4y1j7cs'),
+        'https://bilibili.com/video/BV1Fb4y1j7cs'
+      );
+    });
+
     it('sorts remaining non-tracking query parameters deterministically', () => {
       const url = 'https://example.com/item?z=last&a=first&m=middle';
       assert.strictEqual(normalizeUrl(url), 'https://example.com/item?a=first&m=middle&z=last');
@@ -280,6 +344,14 @@ describe('urlExtractor', () => {
       assert.strictEqual(
         extractPlatformMediaId('https://youtube.com/watch?v=dQw4w9WgXcQ'),
         'youtube:dQw4w9WgXcQ'
+      );
+      assert.strictEqual(
+        extractPlatformMediaId('https://www.bilibili.com/en/video/BV1Fb4y1j7cs/'),
+        'bilibili:BV1Fb4y1j7cs'
+      );
+      assert.strictEqual(
+        extractPlatformMediaId('https://b23.tv/BV1Fb4y1j7cs'),
+        'bilibili:BV1Fb4y1j7cs'
       );
     });
   });

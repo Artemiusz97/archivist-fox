@@ -459,7 +459,9 @@ export async function handleInteraction(interaction) {
         try {
           linkCount = db.prepare('SELECT COUNT(*) as count FROM posted_links').get()?.count || 0;
           mediaCount = db.prepare('SELECT COUNT(*) as count FROM media_records').get()?.count || 0;
-        } catch {}
+        } catch (err) {
+    void err;
+  }
 
         let dbFileSize = 0;
         try {
@@ -467,7 +469,9 @@ export async function handleInteraction(interaction) {
           if (fs.existsSync(dbPath)) {
             dbFileSize = (await fs.promises.stat(dbPath)).size;
           }
-        } catch {}
+        } catch (err) {
+    void err;
+  }
 
         // Check active cookies
         const cookiesDir = config.cookiesDir || path.join(process.cwd(), 'cookies');

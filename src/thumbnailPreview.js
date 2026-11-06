@@ -33,7 +33,9 @@ export async function findThumbnailFile(videoPath, destDir, options = {}) {
         return path.join(directory, file);
       }
     }
-  } catch {}
+  } catch (err) {
+    void err;
+  }
 
   // 3. Extract embedded cover art or representative frame
   const tempExtractedThumb = path.join(directory, `temp_thumb_${Date.now()}.jpg`);

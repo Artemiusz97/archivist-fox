@@ -49,7 +49,9 @@ async function downloadFile(url, destPath) {
   await fs.promises.writeFile(destPath, buffer, { mode: 0o755 });
   try {
     await fs.promises.chmod(destPath, 0o755);
-  } catch {}
+  } catch (err) {
+    void err;
+  }
   console.log(`Downloaded ${path.basename(destPath)} successfully.`);
 }
 
@@ -66,7 +68,9 @@ async function getGalleryDlDownloadUrl() {
         return asset.browser_download_url;
       }
     }
-  } catch {}
+  } catch (err) {
+    void err;
+  }
 
   return process.platform === 'win32'
     ? 'https://codeberg.org/mikf/gallery-dl/releases/download/v1.32.7/gallery-dl.exe'

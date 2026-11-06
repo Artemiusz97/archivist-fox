@@ -11,16 +11,51 @@ import {
   purgeTempDownloadArtifacts,
   isAbortError,
 } from './utils.js';
-import { isAudioUrl, checkNsfwInMetadata } from './urlExtractor.js';
+import { isAudioUrl, checkNsfwInMetadata, canonicalizeBilibiliUrl } from './urlExtractor.js';
 
 const TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes (allows buffer for large downloads and rate-limits)
+
+function isBilibiliUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return false;
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    return host === 'bilibili.com' || host.endsWith('.bilibili.com') || host === 'b23.tv' || host.endsWith('.b23.tv');
+  } catch {
+    return false;
+  }
+}
+
+function isBilibiliTrialCutoffError(err) {
+  const combined = `${err?.message || ''}\n${err?.stderr || ''}\n${err?.stdout || ''}`;
+  return /\b\d+\s+bytes read,\s+\d+\s+more expected\b/i.test(combined);
+}
+
+function resolveSafeSubtitleLangs(rawLangs, subtitleFormat) {
+  const langs = (rawLangs || 'en.*,en').trim();
+  const format = (subtitleFormat || 'srt').toLowerCase().trim();
+  const convertsViaFfmpeg = format === 'srt' || format === 'vtt' || format === 'ass' || format === 'lrc';
+  if (!convertsViaFfmpeg) return langs;
+
+  const tokens = langs.split(',').map((t) => t.trim()).filter(Boolean);
+  const hasWildcardAll = tokens.some((t) => t.toLowerCase() === 'all' || t === '*' || t === '.*');
+  if (!hasWildcardAll) return langs;
+
+  const suffixes = [];
+  if (!tokens.some((t) => /^[-]?danmaku$/i.test(t))) {
+    suffixes.push('-danmaku');
+  }
+  if (!tokens.some((t) => /^[-]?live_chat$/i.test(t))) {
+    suffixes.push('-live_chat');
+  }
+  return suffixes.length > 0 ? `${langs},${suffixes.join(',')}` : langs;
+}
 
 /**
  * Builds shared browser-impersonation, User-Agent, and cookie authentication
  * CLI flags for `yt-dlp` (shared between single downloads and playlist fetches).
  *
  * @param {string} url
- * @param {{ disableBrowserCookies?: boolean }} [options={}]
+ * @param {{ disableBrowserCookies?: boolean, disableCookies?: boolean }} [options={}]
  * @returns {string[]}
  */
 export function buildYtDlpAuthArgs(url, options = {}) {
@@ -52,8 +87,10 @@ export function buildYtDlpAuthArgs(url, options = {}) {
   const activeBrowserType = !isImpersonateDisabled ? impersonateTarget : config.cookiesFromBrowser || 'chrome';
   args.push('--user-agent', getBrowserUserAgent(activeBrowserType));
 
-  const cookiePath = getCookieForUrl(url);
-  const allowBrowserCookies = Boolean(config.cookiesFromBrowser && !options.disableBrowserCookies);
+  const cookiePath = options.disableCookies ? null : getCookieForUrl(url);
+  const allowBrowserCookies = Boolean(
+    config.cookiesFromBrowser && !options.disableBrowserCookies && !options.disableCookies
+  );
   if (allowBrowserCookies) {
     const isYoutube = /youtube\.com|youtu\.be/i.test(url);
     if (config.preferBrowserCookies || isYoutube || !cookiePath || !fs.existsSync(cookiePath)) {
@@ -73,12 +110,13 @@ export function buildYtDlpAuthArgs(url, options = {}) {
  * Supports original titles, thumbnails, and English-by-default subtitle extraction
  * across YouTube and all other video platforms supported by `yt-dlp`.
  *
- * @param {string} url
+ * @param {string} rawUrl
  * @param {string} destDir
  * @param {object} [options={}]
  * @returns {string[]}
  */
-export function buildYtDlpArgs(url, destDir, options = {}) {
+export function buildYtDlpArgs(rawUrl, destDir, options = {}) {
+  const url = canonicalizeBilibiliUrl(rawUrl);
   const hardCapMB = Math.max(1, Math.floor(config.hardCapBytes / (1024 * 1024)));
   const outputTemplate = path.join(destDir, '%(title).150s.%(ext)s');
 
@@ -96,6 +134,19 @@ export function buildYtDlpArgs(url, destDir, options = {}) {
   ];
 
   const shouldExtractAudio = config.enableAudioExtraction && (options.extractAudio || isAudioUrl(url));
+  const isBilibili = isBilibiliUrl(url);
+  const hasBilibiliAuth =
+    isBilibili &&
+    !options.disableCookies &&
+    Boolean((config.cookiesFromBrowser && !options.disableBrowserCookies) || getCookieForUrl(url));
+  const effectiveMaxHeight = options.maxHeight || (isBilibili && !hasBilibiliAuth ? 720 : null);
+
+  if (isBilibili) {
+    args.push('--http-chunk-size', '10M');
+    if (!effectiveMaxHeight) {
+      args.push('--retries', '2');
+    }
+  }
 
   if (shouldExtractAudio) {
     args.push(
@@ -109,7 +160,10 @@ export function buildYtDlpArgs(url, destDir, options = {}) {
     }
   } else {
     args.push(
-      '-f', 'bv*+ba/b',
+      '-f',
+      effectiveMaxHeight
+        ? `bv*[height<=${effectiveMaxHeight}]+ba/b[height<=${effectiveMaxHeight}]/bv*+ba/b`
+        : 'bv*+ba/b',
       '-S', 'res,br,fps',
       '--merge-output-format', 'mp4'
     );
@@ -131,8 +185,9 @@ export function buildYtDlpArgs(url, destDir, options = {}) {
     } else {
       args.push('--write-sub');
     }
-    args.push('--sub-langs', config.subtitleLangs || 'en.*,en');
-    args.push('--convert-subs', config.subtitleFormat || 'srt');
+    const targetFormat = config.subtitleFormat || 'srt';
+    args.push('--sub-langs', resolveSafeSubtitleLangs(config.subtitleLangs, targetFormat));
+    args.push('--convert-subs', targetFormat);
   }
 
   if (options.sleepRequests) {
@@ -161,7 +216,8 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
   const runDl = async (extraOpts = {}) => {
     const combinedOpts = { ...options, ...extraOpts };
     const args = buildYtDlpArgs(url, destDir, combinedOpts);
-    return runProcess(config.ytdlpPath, args, {
+    const execFn = combinedOpts?.execFn || runProcess;
+    return execFn(config.ytdlpPath, args, {
       timeoutMs: TIMEOUT_MS,
       signal: options?.signal,
     });
@@ -171,12 +227,26 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
     await runDl();
   } catch (err) {
     if (options?.signal?.aborted || isAbortError(err)) throw err;
-    if (config.cookiesFromBrowser && isCookieLockError(err) && !options.disableBrowserCookies) {
+    let currentErr = err;
+    if (config.cookiesFromBrowser && isCookieLockError(currentErr) && !options.disableBrowserCookies) {
       console.warn('[yt-dlp] Browser cookie database locked; retrying without browser cookies...');
       await purgeTempDownloadArtifacts(destDir);
-      await runDl({ disableBrowserCookies: true });
-    } else {
-      throw err;
+      try {
+        await runDl({ disableBrowserCookies: true });
+        currentErr = null;
+      } catch (retryErr) {
+        if (options?.signal?.aborted || isAbortError(retryErr)) throw retryErr;
+        currentErr = retryErr;
+      }
+    }
+    if (currentErr) {
+      if (isBilibiliUrl(canonicalizeBilibiliUrl(url)) && !options.maxHeight && isBilibiliTrialCutoffError(currentErr)) {
+        console.warn('[yt-dlp] Bilibili 1080p stream cut off (login/SESSDATA required); retrying at 720p...');
+        await purgeTempDownloadArtifacts(destDir);
+        await runDl({ maxHeight: 720, disableBrowserCookies: true, disableCookies: true });
+      } else {
+        throw currentErr;
+      }
     }
   }
 
@@ -223,7 +293,9 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
       ) {
         isOriginalGif = true;
       }
-    } catch {}
+    } catch (err) {
+    void err;
+  }
   }
 
   return { mediaFiles: mergedMedia, subtitleFiles, isNsfw, isOriginalGif };
@@ -232,7 +304,8 @@ export async function downloadWithYtDlp(url, destDir, options = {}) {
 /**
  * Extracts flat playlist metadata without downloading media.
  */
-export async function fetchFlatPlaylistInfo(url, maxItems = 25, options = {}) {
+export async function fetchFlatPlaylistInfo(rawUrl, maxItems = 25, options = {}) {
+  const url = canonicalizeBilibiliUrl(rawUrl);
   const args = [
     url,
     '--flat-playlist',

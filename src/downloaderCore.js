@@ -13,6 +13,7 @@ import {
   isAudioUrl,
   isDeviantArtUrl,
   extractMediaLinksAsync,
+  canonicalizeBilibiliUrl,
   stripQueryAndTrailingPunctuation,
 } from './urlExtractor.js';
 import {
@@ -72,7 +73,7 @@ export async function downloadPlatformMedia(rawUrl, destDir, maxRetries = 2, dlO
     throw new Error('DOWNLOAD_ABORTED');
   }
 
-  const url = stripQueryAndTrailingPunctuation(rawUrl ? String(rawUrl).trim() : '');
+  const url = canonicalizeBilibiliUrl(stripQueryAndTrailingPunctuation(rawUrl ? String(rawUrl).trim() : ''));
   if (!url) {
     throw new Error('INVALID_URL');
   }
@@ -168,7 +169,7 @@ export async function downloadPlatformMedia(rawUrl, destDir, maxRetries = 2, dlO
  * duplicate checking, perceptual fingerprinting, and local archiving.
  */
 export async function downloadMediaItem(rawUrl, options = {}) {
-  const url = stripQueryAndTrailingPunctuation(rawUrl ? String(rawUrl).trim() : '');
+  const url = canonicalizeBilibiliUrl(stripQueryAndTrailingPunctuation(rawUrl ? String(rawUrl).trim() : ''));
   if (!url) {
     throw new Error('INVALID_URL');
   }
@@ -221,13 +222,14 @@ export async function downloadMediaItem(rawUrl, options = {}) {
 
     const detectedLinks = await extractMediaLinksAsync(url);
     const linkType = detectedLinks[0]?.type || 'platform';
+    const targetUrl = detectedLinks[0]?.url || url;
 
     let dlResult;
     if (linkType === 'direct') {
-      const filePath = await downloadDirect(url, tempDir, config.hardCapBytes, { signal: options.signal });
+      const filePath = await downloadDirect(targetUrl, tempDir, config.hardCapBytes, { signal: options.signal });
       dlResult = [filePath];
     } else {
-      dlResult = await downloadPlatformMedia(url, tempDir, 2, {
+      dlResult = await downloadPlatformMedia(targetUrl, tempDir, 2, {
         audioOnly,
         signal: options.signal,
         skipJitter: options.skipJitter,

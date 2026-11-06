@@ -104,7 +104,9 @@ export async function downloadWithGalleryDl(url, destDir, options = {}) {
         isNsfw = true;
         break;
       }
-    } catch {}
+    } catch (err) {
+    void err;
+  }
   }
 
   return Object.assign(mediaFiles, { mediaFiles, isNsfw });

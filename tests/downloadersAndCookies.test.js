@@ -6,7 +6,7 @@ import os from 'node:os';
 import { withConfigOverrides } from '../src/config.js';
 import { getCookieForUrl } from '../src/cookieVault.js';
 import { getGalleryDlConfigPath, resetGalleryDlConfigCache } from '../src/galleryDlConfig.js';
-import { buildYtDlpArgs, fetchFlatPlaylistInfo } from '../src/ytdlpDownloader.js';
+import { buildYtDlpArgs, downloadWithYtDlp, fetchFlatPlaylistInfo } from '../src/ytdlpDownloader.js';
 import { downloadDirect } from '../src/directDownloader.js';
 import { downloadPlatformMedia } from '../src/downloaderCore.js';
 import { probeMedia, isPrivateIp, runProcess } from '../src/utils.js';
@@ -27,11 +27,32 @@ describe('Downloaders, Cookie Precedence, SSRF & Probe Guards (clean-room verifi
       fs.writeFileSync(path.join(tempCookiesDir, 'youtube.txt'), '# Netscape HTTP Cookie File');
       fs.writeFileSync(path.join(tempCookiesDir, 'twitter.txt'), '# Netscape HTTP Cookie File');
       fs.writeFileSync(path.join(tempCookiesDir, 'instagram.txt'), '# Netscape HTTP Cookie File');
+      fs.writeFileSync(
+        path.join(tempCookiesDir, 'bilibili.txt'),
+        '# Netscape HTTP Cookie File\n.bilibili.com\tTRUE\t/\tFALSE\t1820744486\tbuvid3\tguest_only_token\n'
+      );
+
+      withConfigOverrides({ cookiesDir: tempCookiesDir, cookiesPath: null }, () => {
+        assert.ok(getCookieForUrl('https://www.youtube.com/watch?v=123')?.endsWith('youtube.txt'));
+        assert.ok(getCookieForUrl('https://x.com/user/status/123')?.endsWith('twitter.txt'));
+        assert.ok(getCookieForUrl('https://instagram.com/p/123')?.endsWith('instagram.txt'));
+        assert.strictEqual(
+          getCookieForUrl('https://www.bilibili.com/video/BV1Fb4y1j7cs/'),
+          null,
+          'Guest-only bilibili.txt without SESSDATA must not be treated as authenticated'
+        );
+      });
+
+      fs.writeFileSync(
+        path.join(tempCookiesDir, 'bilibili.txt'),
+        '# Netscape HTTP Cookie File\n.bilibili.com\tTRUE\t/\tTRUE\t1893456000\tSESSDATA\tmember_sess_token\n'
+      );
 
       withConfigOverrides({ cookiesDir: tempCookiesDir }, () => {
         assert.ok(getCookieForUrl('https://www.youtube.com/watch?v=123')?.endsWith('youtube.txt'));
         assert.ok(getCookieForUrl('https://x.com/user/status/123')?.endsWith('twitter.txt'));
         assert.ok(getCookieForUrl('https://instagram.com/p/123')?.endsWith('instagram.txt'));
+        assert.ok(getCookieForUrl('https://b23.tv/BV1Fb4y1j7cs')?.endsWith('bilibili.txt'));
       });
     });
 
@@ -115,6 +136,23 @@ describe('Downloaders, Cookie Precedence, SSRF & Probe Guards (clean-room verifi
 
           const subLangsIndex = vimeoArgs.indexOf('--sub-langs');
           assert.strictEqual(vimeoArgs[subLangsIndex + 1], 'en.*,en', 'Subtitle language must default to English');
+        }
+      );
+
+      withConfigOverrides(
+        {
+          enableSubtitles: true,
+          subtitleLangs: 'all',
+          subtitleFormat: 'srt',
+        },
+        () => {
+          const biliSubArgs = buildYtDlpArgs('https://www.bilibili.com/video/BV1Fb4y1j7cs/', os.tmpdir(), {});
+          const subIdx = biliSubArgs.indexOf('--sub-langs');
+          assert.strictEqual(
+            biliSubArgs[subIdx + 1],
+            'all,-danmaku,-live_chat',
+            'SUBTITLE_LANGS=all must exclude danmaku and live_chat so ffmpeg SubtitlesConvertor never crashes on XML/JSON'
+          );
         }
       );
     });
@@ -347,6 +385,97 @@ describe('Downloaders, Cookie Precedence, SSRF & Probe Guards (clean-room verifi
 
       assert.strictEqual(attempts, 2);
       assert.deepStrictEqual(res.mediaFiles, ['/tmp/recovered.mp4']);
+    });
+
+    it('canonicalizes locale-prefixed Bilibili URLs before invoking yt-dlp in both downloadPlatformMedia and buildYtDlpArgs', async () => {
+      let capturedYtUrl = null;
+      const biliRes = await downloadPlatformMedia(
+        'https://www.bilibili.com/en/video/BV1Fb4y1j7cs/',
+        os.tmpdir(),
+        0,
+        {
+          skipJitter: true,
+          ytdlpRunner: async (u) => {
+            capturedYtUrl = u;
+            return { mediaFiles: ['/tmp/bili.mp4'], subtitleFiles: [] };
+          },
+        }
+      );
+
+      assert.strictEqual(capturedYtUrl, 'https://www.bilibili.com/video/BV1Fb4y1j7cs/');
+      assert.deepStrictEqual(biliRes.mediaFiles, ['/tmp/bili.mp4']);
+
+      const args = buildYtDlpArgs('https://www.bilibili.com/en/video/BV1Fb4y1j7cs/', os.tmpdir(), {});
+      assert.strictEqual(args[0], 'https://www.bilibili.com/video/BV1Fb4y1j7cs/');
+    });
+
+    it('uses 10M HTTP chunks on Bilibili, caps unauthenticated Bilibili at 720p, and retries at 720p on 1080p trial cutoff', async () => {
+      const emptyCookieDir = fs.mkdtempSync(path.join(os.tmpdir(), 'archivist-bili-nocookie-'));
+      const dlTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'archivist-bili-dl-'));
+
+      try {
+        // 1. Unauthenticated Bilibili immediately caps format at <=720p and uses 10M HTTP chunks
+        withConfigOverrides(
+          {
+            cookiesDir: emptyCookieDir,
+            cookiesPath: null,
+            cookiesFromBrowser: '',
+          },
+          () => {
+            const guestArgs = buildYtDlpArgs('https://www.bilibili.com/video/BV1Fb4y1j7cs/', dlTempDir, {});
+            const fIdx = guestArgs.indexOf('-f');
+            assert.strictEqual(guestArgs[fIdx + 1], 'bv*[height<=720]+ba/b[height<=720]/bv*+ba/b');
+
+            const chunkIdx = guestArgs.indexOf('--http-chunk-size');
+            assert.notStrictEqual(chunkIdx, -1, 'Bilibili downloads must set --http-chunk-size to avoid CDN burst throttling');
+            assert.strictEqual(guestArgs[chunkIdx + 1], '10M');
+          }
+        );
+
+        // 2. When cookiesFromBrowser is set (or SESSDATA expired), tries full bv*+ba/b first, then falls back to <=720p on trial stream cutoff
+        await withConfigOverrides(
+          {
+            cookiesDir: emptyCookieDir,
+            cookiesPath: null,
+            cookiesFromBrowser: 'firefox',
+          },
+          async () => {
+            const capturedFormatSelectors = [];
+            const outMp4 = path.join(dlTempDir, 'AI-4K-Hires.mp4');
+
+            const res = await downloadWithYtDlp('https://www.bilibili.com/video/BV1Fb4y1j7cs/', dlTempDir, {
+              execFn: async (_cmd, cliArgs) => {
+                const fIdx = cliArgs.indexOf('-f');
+                capturedFormatSelectors.push(cliArgs[fIdx + 1]);
+                if (capturedFormatSelectors.length === 1) {
+                  fs.writeFileSync(path.join(dlTempDir, 'AI-4K-Hires.f30080.mp4.part'), 'partial');
+                  const err = new Error(
+                    'yt-dlp exited with code 1: ERROR: [download] Got error: 108 bytes read, 58986935 more expected. Giving up after 2 retries'
+                  );
+                  err.stderr = 'ERROR: [download] Got error: 108 bytes read, 58986935 more expected. Giving up after 2 retries\n';
+                  throw err;
+                }
+                fs.writeFileSync(outMp4, 'valid-mp4-bytes');
+                return { code: 0, stdout: '', stderr: '' };
+              },
+            });
+
+            assert.deepStrictEqual(capturedFormatSelectors, [
+              'bv*+ba/b',
+              'bv*[height<=720]+ba/b[height<=720]/bv*+ba/b',
+            ]);
+            assert.deepStrictEqual(res.mediaFiles, [outMp4]);
+            assert.strictEqual(
+              fs.existsSync(path.join(dlTempDir, 'AI-4K-Hires.f30080.mp4.part')),
+              false,
+              'Partial .part artifact from failed 1080p trial attempt must be purged before 720p retry'
+            );
+          }
+        );
+      } finally {
+        fs.rmSync(emptyCookieDir, { recursive: true, force: true });
+        fs.rmSync(dlTempDir, { recursive: true, force: true });
+      }
     });
   });
 

@@ -301,7 +301,9 @@ export async function restoreLinks({
                 postedAt: record.posted_at || Date.now(),
                 content: record.content || null,
               });
-            } catch {}
+            } catch (err) {
+    void err;
+  }
           } catch (err) {
             console.error(`[Link Restorer] Failed to post link <${rawUrl}> to #${destination.name}:`, err.message);
             skippedCount++;
@@ -329,7 +331,9 @@ export async function restoreLinks({
               postedCount,
               skippedCount,
             });
-          } catch {}
+          } catch (err) {
+    void err;
+  }
         }
 
         // Delay between posts to respect Discord rate limits and allow rich embed generation

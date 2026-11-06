@@ -127,7 +127,9 @@ document.addEventListener('DOMContentLoaded', () => {
           versionBadge.textContent = `v${data.version}`;
         }
       }
-    } catch {}
+    } catch (err) {
+    void err;
+  }
   }
   fetchStatus();
 

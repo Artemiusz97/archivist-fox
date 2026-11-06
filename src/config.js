@@ -188,7 +188,7 @@ export const config = {
 
 export function requireDiscordToken() {
   if (!config.token) {
-    console.error('Missing DISCORD_TOKEN in your .env file. Copy .env.example to .env and fill it in.');
+    console.error('Missing Discord bot key in your .env configuration. Copy .env.example to .env and configure it.');
     process.exit(1);
   }
 }

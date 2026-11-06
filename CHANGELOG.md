@@ -23,6 +23,7 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 
 | Version | Release Date | Type | Primary Milestone / Theme |
 | :--- | :--- | :--- | :--- |
+| **[v3.14.0](#v3140---2026-11-06)** | 2026-11-06 | Minor | Bilibili Platform Expansion & Resilient Quality Fallback, Safe Subtitle Resolution, Codebase Hardening, and 190-Test Verification Suite. |
 | **[v3.13.0](#v3130---2026-11-03)** | 2026-11-03 | Minor | User Attachment Auto-Archiving, YouTube Resolution & Premium Bitrate Upgrade Engine, Web UI Range Streaming & Auth Security, O(1) SQLite Disk Telemetry, SWAR Popcount dHash Matching, and 173-Test Native Suite. |
 | **[v3.12.0](#v3120---2026-10-11)** | 2026-10-11 | Minor | Dual-Format High-Quality GIF Pipeline, Idempotent Local Archiver, Instant `/stop` Subprocess Termination, Archive Maintenance CLI Suite (`convert-gifs`, `deduplicate`, `redownload-youtube`), and 94-Test Native Suite. |
 | **[v3.11.1](#v3111---2026-09-26)** | 2026-09-26 | Patch | Link Backup Decoupling, Enhanced Crawler Telemetry, Privacy Hardening & Discord.js v14 Modernization. |
@@ -54,6 +55,23 @@ Archivist Fox uses the standard **Semantic Versioning 2.0.0** scheme (`MAJOR.MIN
 ---
 
 ## Release Details
+
+### [v3.14.0] - 2026-11-06
+
+#### Added & Improved
+- **Bilibili Platform Support & Resilient Quality Fallback (`src/urlExtractor.js`, `src/cookieVault.js`, `src/ytdlpDownloader.js`)**:
+  - Full canonicalization for Bilibili URLs, supporting standard links, international locale/SEO prefixes (`/en/video/BV...`, `/zh-Hans/video/`, `/s/video/`), mobile links (`m.bilibili.com`), and `b23.tv` shortlink unshortening.
+  - Strips Bilibili share tracking parameters (`spm_id_from`, `vd_source`, `share_source`, `share_medium`, `share_plat`, etc.) while strictly preserving multi-part video episode indicators (`?p=`).
+  - Added dedicated Bilibili cookie verification in `src/cookieVault.js` ensuring `SESSDATA` authentication cookies are validated before application.
+  - **Adaptive Quality Fallback:** Bilibili enforces trial cutoffs (~30-60s) on unauthenticated 1080p streams. If login cookies are absent or a trial cutoff error occurs, the bot automatically falls back to 720p with `--http-chunk-size 10M` to guarantee full, uninterrupted video downloads.
+- **Safe Subtitle Language Resolution (`src/ytdlpDownloader.js`)**:
+  - Added `resolveSafeSubtitleLangs()` to sanitize subtitle language selection patterns against target formats, preventing `yt-dlp` sub-language syntax errors during caption extraction.
+- **Codebase-Wide Hardening & Modularity (`src/`)**:
+  - Standardized error handling, unused variable suppression, and process signal propagation across all core archiver, command, and downloader modules.
+  - Added `.desloppify/`, backup files, and temporary artifacts to `.gitignore` to keep git repositories clean.
+- **Expanded Native Test Suite (`tests/`)**:
+  - Added 8 dedicated test suites: `tests/app.test.js`, `tests/autoUpdater.test.js`, `tests/compress.test.js`, `tests/ensureBinaries.test.js`, `tests/galleryDlDownloader.test.js`, `tests/index.test.js`, `tests/thumbnailPreview.test.js`, and `tests/version.test.js`.
+  - Expanded the verification suite to **190 unit and integration tests across 85 suites** with a 100% pass rate.
 
 ### [v3.13.0] - 2026-11-03
 

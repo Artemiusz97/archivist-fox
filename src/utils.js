@@ -82,13 +82,17 @@ export function killProcessTree(child) {
 
   if (process.platform === 'win32') {
     spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }).on('error', () => {
-      try { child.kill('SIGKILL'); } catch {}
+      try { child.kill('SIGKILL'); } catch (err) {
+    void err;
+  }
     });
   } else {
     try {
       process.kill(-child.pid, 'SIGKILL');
     } catch {
-      try { child.kill('SIGKILL'); } catch {}
+      try { child.kill('SIGKILL'); } catch (err) {
+    void err;
+  }
     }
   }
 }
@@ -682,14 +686,18 @@ export async function cleanupStaleTempDirs(maxAgeMs = 60 * 60 * 1000) {
             await fs.promises.rm(fullPath, { recursive: true, force: true });
             cleanedCount++;
           }
-        } catch {}
+        } catch (err) {
+    void err;
+  }
       }
     }
 
     if (cleanedCount > 0) {
       console.log(`[Cleaner] Purged ${cleanedCount} stale temporary directories from previous runs.`);
     }
-  } catch {}
+  } catch (err) {
+    void err;
+  }
 }
 
 /**
@@ -852,7 +860,9 @@ export function getBrowserHeaders(firstArg, secondArg = {}, thirdArg = {}) {
       } else if (host === 'i.redd.it' || host === 'v.redd.it' || host.endsWith('.redd.it')) {
         headers.Referer = 'https://www.reddit.com/';
       }
-    } catch {}
+    } catch (err) {
+    void err;
+  }
   }
 
   if (options.referer) {
@@ -915,7 +925,9 @@ export async function purgeTempDownloadArtifacts(dir) {
         await fs.promises.unlink(path.join(dir, entry.name)).catch(() => {});
       }
     }
-  } catch {}
+  } catch (err) {
+    void err;
+  }
 }
 
 export function isCookieLockError(err) {

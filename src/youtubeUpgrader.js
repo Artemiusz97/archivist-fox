@@ -311,7 +311,9 @@ export async function probeVideoQuality(filePath, probeFn = probeMedia) {
   let sizeBytes = 0;
   try {
     sizeBytes = (await fs.promises.stat(filePath)).size;
-  } catch {}
+  } catch (err) {
+    void err;
+  }
 
   const duration = Number(info.duration) || 0;
   const totalBps =
@@ -483,7 +485,9 @@ function readJsonSafe(jsonPath) {
     if (fs.existsSync(jsonPath)) {
       return JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
     }
-  } catch {}
+  } catch (err) {
+    void err;
+  }
   return null;
 }
 
@@ -603,7 +607,9 @@ export async function upgradeYoutubeArchive(options = {}) {
             totalIndexedFiles++;
           }
         }
-      } catch {}
+      } catch (err) {
+    void err;
+  }
     }
     indexDir(archiveRoot);
     log(`Indexed ${totalIndexedFiles} media files in local archive.`);

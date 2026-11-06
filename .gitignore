@@ -42,9 +42,13 @@ tempmediaStorage/
 .DS_Store
 Thumbs.db
 *.log
+*.bak
+*.bak-*
 __pycache__/
 *.pyc
 scratch/
+.desloppify/
+scorecard.png
 
 # Distribution & Release Archives
 releases/

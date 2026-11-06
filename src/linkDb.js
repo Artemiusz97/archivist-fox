@@ -113,7 +113,9 @@ export function initLinkDb(customPath) {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_posted_links_msg_url ON posted_links (message_id, normalized_url);
       `);
     }
-  } catch {}
+  } catch (err) {
+    void err;
+  }
 
   try {
     const mediaCols = dbInstance.prepare('PRAGMA table_info(media_records)').all();
@@ -126,7 +128,9 @@ export function initLinkDb(customPath) {
     dbInstance.exec(
       'CREATE INDEX IF NOT EXISTS idx_media_image_hashes ON media_records(id) WHERE (duration = 0 OR duration IS NULL) AND hash IS NOT NULL;'
     );
-  } catch {}
+  } catch (err) {
+    void err;
+  }
 
   // Cache hot prepared statements on the instance so SQLite doesn't re-parse
   // and compile the same SQL strings on every chat message and crawl iteration.
@@ -465,7 +469,9 @@ export function backupDatabaseSafely(db, backupPath) {
   } catch (err) {
     try {
       db.exec('PRAGMA wal_checkpoint(PASSIVE);');
-    } catch {}
+    } catch (err) {
+    void err;
+  }
     const sourcePath = db._dbPath || config.linkDbPath || path.join(process.cwd(), 'data', 'links.db');
     if (fs.existsSync(sourcePath)) {
       fs.copyFileSync(sourcePath, normalizedBackupPath);

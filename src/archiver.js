@@ -78,7 +78,9 @@ export async function archiveLocalMedia(sourceFilePath, context = {}) {
           } else if (context.sha256 && existingMeta.sha256 && context.sha256 === existingMeta.sha256) {
             isSameMedia = true;
           }
-        } catch {}
+        } catch (err) {
+    void err;
+  }
       }
 
       if (!isSameMedia && sourceStat && destStat && sourceStat.size === destStat.size && sourceStat.size > 0) {
@@ -105,7 +107,9 @@ export async function archiveLocalMedia(sourceFilePath, context = {}) {
             meta.fileSizeBytes = destStat.size;
             if (context.isNsfw) meta.isNsfw = true;
             await fs.promises.writeFile(metadataPath, JSON.stringify(meta, null, 2), 'utf-8');
-          } catch {}
+          } catch (err) {
+    void err;
+  }
         }
         return destPath;
       }
@@ -132,9 +136,13 @@ export async function archiveLocalMedia(sourceFilePath, context = {}) {
                   break;
                 }
               }
-            } catch {}
+            } catch (err) {
+    void err;
+  }
           }
-        } catch {}
+        } catch (err) {
+    void err;
+  }
       }
 
       if (foundExistingCollidedPath) {
@@ -277,7 +285,9 @@ export async function prepareSubtitleAttachments(
       if (stat.size > 0 && stat.size <= config.maxFileSizeBytes) {
         validSubs.push(subPath);
       }
-    } catch {}
+    } catch (err) {
+    void err;
+  }
   }
 
   if (validSubs.length === 0) return [];
@@ -320,9 +330,10 @@ export async function prepareSubtitleAttachments(
         }
         return [attachment];
       }
-    } catch {
-      // Fall back to attaching up to maxIndividual subtitle files individually
-    }
+    } catch (err) {
+    void err;
+    // Fall back to attaching up to maxIndividual subtitle files individually
+  }
   }
 
   const attachments = [];

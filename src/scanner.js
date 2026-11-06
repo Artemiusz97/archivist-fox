@@ -59,7 +59,9 @@ export function requestScanStop() {
     if (scanAbortController) {
       try {
         scanAbortController.abort();
-      } catch {}
+      } catch (err) {
+    void err;
+  }
     }
     return true;
   }
@@ -74,7 +76,9 @@ export function stopActiveTasks() {
   if (scanAbortController) {
     try {
       scanAbortController.abort();
-    } catch {}
+    } catch (err) {
+    void err;
+  }
   }
   requestRestoreStop();
   const { activeStopped, queueCleared } = downloadQueue.stopAll();

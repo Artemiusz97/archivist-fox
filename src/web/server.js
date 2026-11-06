@@ -54,7 +54,9 @@ async function verifyContainedRealPath(candidatePath, archiveRoot, { allowRootDi
     if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
       return realCandidate;
     }
-  } catch {}
+  } catch (err) {
+    void err;
+  }
   return null;
 }
 
@@ -133,7 +135,9 @@ async function findArchivedFile(targetFile) {
         }
       }
     }
-  } catch {}
+  } catch (err) {
+    void err;
+  }
 
   // 3. Fallback recursive search inside realArchiveRoot
   async function searchDir(dir) {
@@ -148,7 +152,9 @@ async function findArchivedFile(targetFile) {
           return await verifyContainedRealPath(full, realArchiveRoot);
         }
       }
-    } catch {}
+    } catch (err) {
+    void err;
+  }
     return null;
   }
 
@@ -283,7 +289,9 @@ function broadcastTaskUpdate(taskId, update) {
         if (shouldClose) {
           res.end();
         }
-      } catch {}
+      } catch (err) {
+    void err;
+  }
     }
     if (shouldClose) {
       sseSubscribers.delete(taskId);
@@ -775,7 +783,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename
             process.exit(0);
           }
         }
-      } catch {}
+      } catch (err) {
+    void err;
+  }
     }
     process.exit(1);
   });

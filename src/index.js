@@ -316,7 +316,7 @@ async function loginWithRetry(discordClient, token, maxRetries = 5) {
         err.message?.includes('An invalid token was provided');
 
       if (isAuthError) {
-        console.error('[Login] ❌ Fatal Authentication Error: The DISCORD_TOKEN in your .env file is invalid.');
+        console.error('[Login] ❌ Fatal Authentication Error: The Discord bot login key configured in .env is invalid.');
         throw err;
       }
 
@@ -385,7 +385,9 @@ async function handleShutdown(signal) {
     }
     closeLinkDb();
     await client.destroy().catch(() => {});
-  } catch {}
+  } catch (err) {
+    void err;
+  }
   process.exit(0);
 }
 

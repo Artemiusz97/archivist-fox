@@ -57,7 +57,9 @@ export async function getBestVideoEncoder() {
       detectedGpuEncoder = 'h264_amf';
       return detectedGpuEncoder;
     }
-  } catch {}
+  } catch (err) {
+    void err;
+  }
 
   detectedGpuEncoder = 'libx264';
   return detectedGpuEncoder;

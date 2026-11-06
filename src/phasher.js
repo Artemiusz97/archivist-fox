@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { config } from './config.js';
 import { extractPlatformMediaId } from './urlExtractor.js';
 import {
-  isVideo,
+
   isAudio,
   killProcessTree,
   probeMedia,

@@ -347,7 +347,9 @@ async function computeDirectoryBytesFallback(dirPath) {
         if (stat) total += stat.size;
       }
     }
-  } catch {}
+  } catch (err) {
+    void err;
+  }
   return total;
 }
 

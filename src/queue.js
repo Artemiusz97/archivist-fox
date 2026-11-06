@@ -84,7 +84,9 @@ export class DownloadQueue {
           } else if (typeof item.message.reactions?.resolve === 'function') {
             item.message.reactions.resolve(reaction)?.users?.remove(botUserId).catch(() => {});
           }
-        } catch {}
+        } catch (err) {
+    void err;
+  }
       };
       if (item.queuedReaction) {
         removeQueued(item.queuedReaction);
@@ -107,7 +109,9 @@ export class DownloadQueue {
     for (const active of this.activeTasks) {
       try {
         active.abortController.abort();
-      } catch {}
+      } catch (err) {
+    void err;
+  }
       // Remove reactions eagerly for immediate UI responsiveness
       active.cleanupReactions().catch(() => {});
     }
@@ -171,7 +175,9 @@ export class DownloadQueue {
         } else if (reactionOrEmoji.users) {
           await reactionOrEmoji.users.remove(botUserId).catch(() => {});
         }
-      } catch {}
+      } catch (err) {
+    void err;
+  }
     };
 
     const cleanupReactions = async () => {
@@ -229,7 +235,9 @@ export class DownloadQueue {
           const react = await message.react('⚙️').catch(() => null);
           if (react) activeReactions.set('⚙️', react);
         }
-      } catch {}
+      } catch (err) {
+    void err;
+  }
     };
 
     try {
@@ -261,7 +269,9 @@ export class DownloadQueue {
       this.activeTasks.delete(activeTask);
       try {
         await cleanupReactions();
-      } catch {}
+      } catch (err) {
+    void err;
+  }
       this.running--;
       this.processNext();
     }
